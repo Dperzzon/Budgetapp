@@ -13,7 +13,15 @@
 The desktop app runs as a local Tauri shell with a React UI and a Rust-backed SQLite datastore. The data lives in the OS app data directory, which keeps costs near zero and avoids cloud dependencies.
 
 ## Database design
-A local SQLite database stores transaction history, categories, learned merchant rules, and monthly category budgets. Existing transaction databases are upgraded on startup when new columns are needed.
+A local SQLite database stores transaction history, import batches, categories, learned merchant rules, and monthly category budgets. `PRAGMA user_version` identifies the supported schema. Ordered migrations run in SQLite transactions, newer unknown schema versions are rejected, and foreign keys are enabled for every application connection. Schema version 3 adds a required `transaction_type` with a database `CHECK` constraint for `income`, `expense`, `saving`, `amortization`, `transfer`, `refund`, and `unclassified`.
+
+Schema version 4 replaces active `REAL` money storage with `transactions.amount_cents INTEGER NOT NULL` and `budgets.amount_cents INTEGER NOT NULL`. The migration rebuilds both tables, preserves transaction IDs, import-batch foreign keys, provenance, categories, transaction types, review state, and budget identities, then verifies row counts, metadata, cent totals, and `PRAGMA foreign_key_check` before commit. There is no permanent dual-write model.
+
+Schema version 5 adds `learned_transaction_type_rules`, keyed by the exact normalized merchant key with the same constrained transaction-type values as transactions. Type rules are separate from category rules because they control financial semantics, not what a purchase concerns.
+
+Before a database below schema 4 with an existing transaction table is migrated, SQLite's backup API creates a local sibling file named like `budgetapp.pre-schema-4-<timestamp>.sqlite`. A failed migration leaves both the original schema and the backup intact, and the initialization error reports the backup path.
+
+Legacy `REAL` values are multiplied by 100 in Rust and compared with the nearest integer. Conversion is accepted only when the difference is at most `1e-7` cents and the result is within JavaScript's safe-integer range. Rust's round-to-nearest, half-away-from-zero rule is explicit, although a genuine half-cent is rejected by the precision check rather than rounded. This accepts representational noise such as `10.099999999999` but blocks real extra precision such as `10.123`.
 
 The schema is intentionally simple and deterministic so that the app can be audited and data can be exported or repaired without a cloud service.
 
@@ -27,13 +35,144 @@ The import pipeline is deterministic and conservative:
 6. flag uncertain merchants or invalid dates for manual review
 7. preview parsed transactions before confirmation
 8. flag possible duplicates matching date, merchant, and amount without suppressing any row
-9. persist every transaction and its review status in SQLite
+9. calculate a local SHA-256 hash from the exact file bytes and block files that already have an import batch
+10. persist the import batch and all accepted transactions atomically with source file, worksheet, and Excel row provenance
 
-The dashboard filters persisted rows by year and month. It compares the selected period with the same month or year from a separately selected comparison year. Monthly budgets are editable per category and stored in SQLite; annual budget totals sum that year's monthly budgets. The review view allows changing the category or explicitly deleting a selected transaction; rows with invalid dates remain visible there regardless of period filter.
+Tracked imports are listed from SQL aggregates rather than duplicated counters. Deleting an import batch uses the transaction foreign key with `ON DELETE CASCADE`, so its transactions are removed atomically while legacy transactions, other batches, and learned rules remain untouched. Existing transactions created before import batches keep nullable provenance and are not assigned fabricated batches.
 
-When a user changes a transaction's category, the normalized merchant and selected category are saved as a learned rule. This rule takes priority over built-in rules on later imports and remains local. Amortization is stored as `Sparande / Amortering` and included in the `Sparande` budget total; Wi-Fi is `Boende / Wi-Fi`.
+The dashboard filters persisted rows by year and month. It compares the selected period with the same month or year from a separately selected comparison year. Monthly budgets are editable per category and stored in SQLite; annual budget totals sum that year's monthly budgets. The review view allows changing the category, changing the economic type of only the selected transaction, or explicitly deleting a selected transaction. Invalid imported dates are blocking validation errors and are not persisted.
 
-The parser rejects malformed rows and surfaces them to the user instead of silently dropping them.
+Changing a category affects only the selected transaction by default. The user can explicitly choose an exact normalized-merchant bulk update or save an exact learned rule for future imports; these are separate backend operations, and neither happens implicitly. Category describes what a transaction concerns, while `transaction_type` independently controls its financial effect.
+
+Changing an economic type also starts as an unsaved draft. The user must explicitly choose `Endast denna`, `Ändra liknande`, or `Kom ihåg framåt`. Exact bulk updates are atomic and affect only rows with the same normalized merchant key. Remembering a type atomically updates the selected row and stores a separate rule for future imports; it never rewrites historical matches and never changes category. Swish normalization is direction-aware: received and sent Swish use different keys while phone-number variants within the same direction can share a rule.
+
+Legacy rows are mapped deterministically during the version 2 to 3 migration: `Överföring mellan konto` becomes `transfer`, `Sparande` becomes `saving`, `Sparande / Amortering` becomes `amortization`, positive `Lön`, `Bidrag`, and `Uthyrning` become `income`, and other negative values become `expense`. Other positive and zero values become `unclassified`; migration never rewrites categories. New imports use the same conservative mapping, so a positive refund or transfer is not guessed to be income.
+
+Financial calculations live in `finance.ts` and are shared by dashboard, monthly comparison, category outcomes, and budgets. All values below are integer cents and conversion to kronor happens only in the central presentation formatter:
+- income = sum of `income` amounts
+- consumption expenses = negative sum of `expense` and `refund` amounts
+- direct savings = negative sum of `saving` amounts
+- amortization = negative sum of `amortization` amounts
+- total wealth building = direct savings + amortization
+- remaining after spending and saving = income - consumption expenses - direct savings - amortization
+
+Only `expense` and `refund` affect consumption-category budget outcomes. Transfers and unclassified rows affect none of the main financial totals, and unclassified rows remain visible in the review queue.
+
+## Monthly change insights
+Monthly insights are derived in memory by `buildMonthlyInsights` in `finance.ts`; no insight data is persisted. Full analysis is available only for a selected completed month. The year view asks the user to select a month, and the current or a future month states that analysis will be available after the month closes.
+
+The baseline uses all earlier completed months that contain `expense` or `refund` data. With at least two such months, each category baseline and the total baseline are the rounded monthly averages across the same month set, including zero for months where a category was absent. With exactly one historical month, comparison is allowed only when it is the immediately previous calendar month. Older isolated history separated by a gap is not presented as the previous-month fallback. With no valid baseline, no synthetic change is shown.
+
+Category consumption follows the existing financial semantics:
+
+```text
+actual = -sum(expense and refund amounts)
+delta = current actual - baseline actual
+percent = delta / baseline * 100, only when baseline > 0
+```
+
+A category is displayed as a meaningful change when its absolute delta is at least 200 kr, or when its absolute delta is at least 100 kr and its absolute percentage change is at least 20 percent. This prevents tiny amounts with dramatic percentages from dominating.
+
+Unusual purchases consider only negative `expense` transactions in the selected month. At least five historical expense transactions from the baseline months are required. The threshold is the larger of 1,000 kr and three times the historical median expense size. A merchant with at least two prior exact-normalized purchases is suppressed when the current amount is no more than 1.5 times that merchant's historical median, avoiding a simple form of false positive without introducing recurring-expense detection.
+
+Top merchants use the existing conservative normalized merchant key. `expense` and `refund` amounts for the same exact key are netted, merchants with non-positive net spend are omitted, and broad merchant-family or fuzzy matching is not used.
+
+## Recurring expense insights
+Recurring insights are derived in memory by `buildRecurringExpenseInsights`; no recurring flags, frequencies, confidence levels, or normal amounts are persisted. Analysis uses negative `expense` transactions within the 12-month lookback ending at the selected reference month. A charge already present in the current month may be the latest occurrence, but an absent current-month charge is never treated as missing evidence.
+
+Transactions are grouped only by the existing exact normalized merchant key. A merchant with more than 1.5 transactions per active month or more than two transactions in any analyzed month is excluded before frequency detection. This prevents frequent shops from being presented as periodic debits without a hardcoded merchant list.
+
+Calendar-month intervals determine frequency:
+- monthly: at least three occurrences and at least 60 percent of intervals are one or two calendar months
+- quarterly: at least three occurrences and at least 60 percent of intervals are two through four calendar months
+- annual: at least two occurrences and at least 60 percent of intervals are 11 through 13 calendar months
+- irregular: at least four occurrences, no periodic match, and at least 80 percent amount stability
+
+Monthly detection runs before quarterly detection so an occasional missed monthly charge remains monthly. Date-of-month differences do not matter. At least two completed months containing eligible expenses are required before any candidate is shown.
+
+The normal amount is the median absolute expense amount. Amount stability is the share of occurrences within plus or minus 15 percent of that median. High confidence requires a periodic frequency, at least five occurrences, at least 80 percent matching intervals, at least 80 percent amount stability, and at least 90 percent active-month coverage. Medium confidence requires a periodic frequency with at least 60 percent interval regularity and amount stability. Other retained candidates are low confidence.
+
+The latest amount is compared with the median of all earlier occurrences, excluding itself. A price difference is relevant when its absolute amount is at least 20 kr, or at least 10 kr together with an absolute percentage difference of at least 10 percent. Stable histories use cautious “price seems to have changed” copy; unstable histories only state that the latest amount is above or below the median.
+
+Annualized cost uses the all-occurrence median:
+
+```text
+monthly = median * 12
+quarterly = median * 4
+annual = median
+irregular = unavailable
+```
+
+Candidates are sorted by relevant price increase, then confidence, annualized cost, and merchant label. At most eight are shown.
+
+## Recurring cost trends
+Long-term trends reuse the same recurring candidate derivation, merchant grouping, frequency detection, amount stability, and false-positive filtering. The trend builder uses a 36-month lookback so annual costs can reach the required three observations; the ordinary recurring-cost UI remains limited to 12 months. Irregular candidates are excluded.
+
+Monthly and quarterly candidates require at least five observations spanning at least four calendar months. Annual candidates require at least three observations, so two annual payments never create a long-term trend.
+
+Period levels use medians rather than individual endpoint payments:
+- 5–7 observations: first two payments compared with the last two
+- 8 or more observations: the first `floor(count / 3)` payments compared with the last equally sized group
+- three annual observations: the same first-two/last-two rule, with the middle observation shared
+
+The formulas are:
+
+```text
+delta = recent period median - first period median
+percent = delta / first period median * 100
+```
+
+A trend is increasing or decreasing only when the absolute delta is at least 20 kr and the absolute percentage is at least 5 percent. Everything else is stable. A single latest-payment spike therefore remains a Phase 2B signal but normally cannot establish a Phase 2C trend.
+
+Trend confidence is intentionally stricter than candidate confidence:
+- high: a clear trend, medium/high recurring candidate, at least six observations, at least 80 percent amount stability, and at least 60 percent successive changes in the trend direction
+- medium: a clear trend, medium/high recurring candidate, and at least 60 percent amount stability
+- low: other eligible evidence
+
+Low-confidence increases are retained in the derived model but hidden from the main UI. Increasing trends are sorted by confidence, absolute delta, percentage delta, and merchant label; at most five are displayed. High-stability cards say the typical cost level increased, while more variable histories only say the recent typical level is higher.
+
+Annualized impact reuses the recurring frequency multipliers:
+
+```text
+monthly delta * 12
+quarterly delta * 4
+annual delta
+```
+
+No forecasting, inflation adjustment, or trend persistence is involved.
+
+## Budget calculations
+Derived budget rows are centralized in `finance.ts` and are never persisted. A row contains budget, actual, remaining amount, percentage used, historical monthly average, and an optional annual forecast. The row set is the union of categories with relevant actuals and categories with a saved budget, so a saved budget remains visible when actual is zero.
+
+Budget sections have separate semantics:
+- consumption: `expense` and `refund`
+- income goals: `income`
+- direct-saving goals: `saving`
+- amortization goals: `amortization`
+
+The existing budget table is reused without a schema change. `Sparande` identifies the direct-saving goal and `Sparande / Amortering` identifies the amortization goal; `Lön`, `Bidrag`, and `Uthyrning` remain income goals. Other saved category budgets are consumption budgets.
+
+A covered month is a completed calendar month containing at least one transaction relevant to that budget section. For consumption this means `expense` or `refund`; months containing only transfers or unclassified rows do not count. The current calendar month is excluded, while all relevant months in a completed historical year may count.
+
+Historical monthly average is:
+
+```text
+sum of category actuals in covered completed months / number of covered completed months
+```
+
+The numerator remains integer cents. The derived quotient may contain a fractional cent and is rounded only by the presentation formatter. An annual forecast is shown only with at least two covered completed months:
+
+```text
+historical monthly average * 12
+```
+
+It is labeled as an estimate and is separate from actual outcome. Annual budget coverage is `COUNT(DISTINCT month)` for saved rows in the selected year; missing months are reported rather than treated as automatically budgeted at zero.
+
+Percentage used is `actual / budget * 100` only when budget is greater than zero. A zero or absent budget yields no percentage, avoiding `NaN` and infinity. Negative actuals from refunds larger than expenses are preserved without clamping.
+
+The parser returns accepted rows, warnings, and blocking errors with sheet, row number, original value, and a clear reason. Blocking errors disable import, while excluded zero-amount rows and sheets without transaction headers remain visible as warnings instead of disappearing silently.
+
+Imported money text is normalized directly into integer cents for the supported Swedish and international separator formats. Numeric Excel cells and cached formula results are accepted only when they are within `1e-7` cents of an integer cent; genuine precision beyond two decimals is a blocking import error.
 
 ## Classification architecture
 The classification layer is rule-first and explanation-driven:

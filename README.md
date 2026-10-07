@@ -110,9 +110,24 @@ The app currently supports:
 - importing one or more `.xlsx` bank files with a reviewable preview
 - local SQLite storage for transactions and monthly category budgets
 - automatic classification for known merchant rules and a manual review queue for uncertain rows
-- learned merchant rules: changing a transaction category saves a local rule that takes priority on future imports
-- `Boende / Wi-Fi` and `Sparande / Amortering`, with amortization included in the savings budget total
+- safe category changes: a manual change affects only the selected transaction by default; bulk updates and future learned rules require separate explicit choices
+- structured Excel validation that lists accepted rows, warnings, and blocking errors before import
+- exact-file reimport protection using a local SHA-256 hash, with import history, per-row provenance, and atomic undo for tracked imports
+- an explicit economic transaction type, separate from category, for income, expenses, saving, amortization, transfers, refunds, and unclassified rows
+- conservative type assignment: known income categories and explicit saving/transfer categories are recognized, negative purchases become expenses, and uncertain positive rows require review
+- shared dashboard and budget semantics where refunds reduce category spending, transfers and unclassified rows are excluded, and saving and amortization are reported separately
+- safe transaction-type correction with three explicit choices: update only the selected row, update exact normalized-merchant matches, or remember the type for future imports; the safest single-row choice is the default
+- direction-aware Swish matching, so received Swish transactions can share an economic type without affecting sent Swish transactions or changing their categories
+- integer-cent storage and calculations for transactions, budgets, import history, duplicate keys, and dashboard totals
+- a local pre-schema-4 SQLite backup before legacy `REAL` money columns are rebuilt as integer-cent columns
+- budget rows built from both actuals and saved budgets, including categories with zero actual
+- historical monthly averages based on relevant completed months, with clearly separate annual estimates
+- consumption budgets separated from income goals, direct-saving goals, and amortization goals
 - dashboard filtering by year and month, with same-period comparison to a chosen year
+- deterministic monthly change insights showing meaningful category increases and decreases, total change, unusual purchases, and top exact-normalized merchants
+- transparent comparison labels based on earlier completed consumption months, with no full-month comparison for the current month
+- conservative recurring-expense insights with approximate frequency, payment evidence, median normal amount, cautious price-change signals, and annualized periodic cost
+- long-term recurring-cost trends based on earlier and recent period medians, with conservative confidence and annualized impact
 - spending-by-month comparison, category budget-versus-actual, import source summaries, and transaction history
 - possible duplicate detection by date, merchant, and amount; duplicate rows are still imported and flagged for manual review
 - manual category changes and deletion for any transaction in the selected period
