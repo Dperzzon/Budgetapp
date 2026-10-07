@@ -91,13 +91,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .overview-sections { display: flex; flex-direction: column; }
 .overview-sections > .health-panel { order: 1; }
 .overview-sections > .stats-grid { order: 2; }
-.overview-sections > .budget-panel { order: 3; }
+.overview-sections > .dashboard-grid { order: 3; }
 .overview-sections > .review-callout { order: 4; }
-.overview-sections > .deep-analysis { order: 5; }
-.overview-sections > .dashboard-grid { order: 6; }
+.overview-sections > .budget-panel { order: 5; }
+.overview-sections > .deep-analysis { order: 6; }
 .overview-sections > .transactions-panel { order: 7; }
 
-.stats-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+.stats-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
 .stat-card { min-width: 0; display: flex; flex-direction: column; gap: 6px; padding: 16px 17px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); }
 .stat-card > span { color: var(--muted); font-size: .82rem; font-weight: 600; }
 .stat-card strong { overflow-wrap: anywhere; font-size: 1.55rem; font-weight: 720; }

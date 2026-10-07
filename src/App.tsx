@@ -688,6 +688,13 @@ export default function App() {
     ),
     [categoryOptions, categoryRows]
   );
+  const averageMonthlyConsumptionCents = useMemo(() => {
+    if (!consumptionBudget.coveredMonths.length) return null;
+    return Math.round(consumptionBudget.rows.reduce(
+      (total, row) => total + (row.historicalMonthlyAverageCents ?? 0),
+      0
+    ));
+  }, [consumptionBudget]);
 
   const monthlyComparison = useMemo(() => {
     const expensesByMonth = (year: string) => Array.from({ length: 12 }, (_, index) =>
@@ -1494,6 +1501,17 @@ export default function App() {
             </article>
 
             {dashboardSections.includes('summary') && <div className="stats-grid">
+              {selectedMonth === 'all' && (
+                <article className="stat-card expense">
+                  <span>Genomsnittlig månadskostnad</span>
+                  <strong>{averageMonthlyConsumptionCents == null ? '—' : formatMoney(averageMonthlyConsumptionCents)}</strong>
+                  <small>
+                    {consumptionBudget.coveredMonths.length
+                      ? `snitt för ${consumptionBudget.coveredMonths.length} avslutade månader`
+                      : 'otillräcklig historik'}
+                  </small>
+                </article>
+              )}
               <article className="stat-card expense"><span>Konsumtionsutgifter</span><strong>{formatMoney(summary.current.consumptionExpensesCents)}</strong><small>{formatMoney(summary.current.consumptionExpensesCents - summary.comparison.consumptionExpensesCents)} mot {comparisonLabel}</small></article>
               <article className="stat-card income"><span>Inkomster</span><strong>{formatMoney(summary.current.incomeCents)}</strong><small>{formatMoney(summary.current.incomeCents - summary.comparison.incomeCents)} mot {comparisonLabel}</small></article>
               <article className="stat-card save"><span>Sparande</span><strong>{formatMoney(summary.current.directSavingsCents)}</strong><small>direkt sparande</small></article>
