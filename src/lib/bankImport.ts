@@ -1,6 +1,8 @@
 import {
   hasBankTransactionHeaders,
   inferTransactionType,
+  isCategoryTransactionTypeConsistent,
+  type ClassificationDecision,
   type TransactionType,
 } from './finance';
 
@@ -46,6 +48,8 @@ export type ImportResult = {
 type Classifier = (transaction: { merchant: string; amountCents: number }) => {
   category: string;
   needsReview: boolean;
+  source?: ClassificationDecision['source'];
+  ruleId?: string;
   transactionType?: TransactionType;
 };
 
@@ -398,8 +402,21 @@ export function parseWorkbookSheets(
         }
 
         const decision = classify({ merchant, amountCents: parsedAmount.amountCents });
+        const learnedCategoryWithoutType = decision.source === 'explicit-user-rule' &&
+          decision.ruleId?.startsWith('learned-') === true &&
+          decision.transactionType === undefined;
         const transactionType = decision.transactionType ??
-          inferTransactionType(decision.category, parsedAmount.amountCents);
+          inferTransactionType(
+            learnedCategoryWithoutType ? 'Okategoriserat' : decision.category,
+            parsedAmount.amountCents
+          );
+        const hasSemanticConflict = !isCategoryTransactionTypeConsistent(
+          decision.category,
+          transactionType
+        );
+        const needsReview = decision.needsReview ||
+          transactionType === 'unclassified' ||
+          hasSemanticConflict;
         const transaction: ImportedBankTransaction = {
           id: `${fileName}-${lastModified}-${sheetIndex}-${row.rowNumber}`,
           date: parsedDate.value,
@@ -408,7 +425,7 @@ export function parseWorkbookSheets(
           category: decision.category,
           transactionType,
           sourceFile: fileName,
-          needsReview: decision.needsReview,
+          needsReview,
           categoryDecided: false,
           importedSheet: worksheet.name,
           importedRow: row.rowNumber,
@@ -420,6 +437,20 @@ export function parseWorkbookSheets(
             field: 'merchant',
             originalValue: merchantValue,
             message: 'Ingen säker kategori hittades. Raden importeras för manuell granskning.',
+          }));
+        } else if (hasSemanticConflict) {
+          result.warnings.push(createIssue('warning', worksheet.name, row.rowNumber, {
+            code: 'category-type-conflict',
+            field: 'merchant',
+            originalValue: merchantValue,
+            message: 'Kategori och ekonomisk typ behöver stämmas av manuellt.',
+          }));
+        } else if (transactionType === 'unclassified') {
+          result.warnings.push(createIssue('warning', worksheet.name, row.rowNumber, {
+            code: 'unclassified-transaction-type',
+            field: 'merchant',
+            originalValue: merchantValue,
+            message: 'Ekonomisk typ behöver väljas manuellt.',
           }));
         }
       }

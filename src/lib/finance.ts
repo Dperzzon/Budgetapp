@@ -20,6 +20,7 @@ export const transactionTypes = [
 export type TransactionType = typeof transactionTypes[number];
 
 export type PeriodStatus = 'past' | 'current' | 'future';
+export type TransactionDirectionFilter = 'all' | 'incoming' | 'outgoing';
 
 export function getPeriodStatus(
   year: number,
@@ -31,6 +32,19 @@ export function getPeriodStatus(
   if (target < current) return 'past';
   if (target > current) return 'future';
   return 'current';
+}
+
+export function filterTransactionsByDirection<T extends { amountCents: number }>(
+  transactions: T[],
+  direction: TransactionDirectionFilter
+): T[] {
+  if (direction === 'incoming') {
+    return transactions.filter((transaction) => transaction.amountCents > 0);
+  }
+  if (direction === 'outgoing') {
+    return transactions.filter((transaction) => transaction.amountCents < 0);
+  }
+  return transactions;
 }
 
 export type FinancialTransaction = {
@@ -184,6 +198,24 @@ export type FinancialHealthSummary = {
 
 const incomeCategories = new Set(['Lön', 'Bidrag', 'Uthyrning']);
 
+export function expectedTransactionTypeForCategory(
+  category: string
+): TransactionType | undefined {
+  if (category === 'Överföring mellan konto') return 'transfer';
+  if (category === 'Sparande') return 'saving';
+  if (category === 'Sparande / Amortering') return 'amortization';
+  if (incomeCategories.has(category)) return 'income';
+  return undefined;
+}
+
+export function isCategoryTransactionTypeConsistent(
+  category: string,
+  transactionType: TransactionType
+): boolean {
+  const expected = expectedTransactionTypeForCategory(category);
+  return expected === undefined || expected === transactionType;
+}
+
 export function inferTransactionType(
   category: string,
   amountCents: number
@@ -287,6 +319,20 @@ export function budgetKindForCategory(category: string): BudgetKind {
   if (category === 'Sparande / Amortering') return 'amortization';
   if (incomeCategories.has(category)) return 'income';
   return 'consumption';
+}
+
+export function availableConsumptionBudgetCategories(
+  categoryLabels: string[],
+  existingCategories: Iterable<string>
+): string[] {
+  const existing = new Set(existingCategories);
+  return categoryLabels.filter((category, index) =>
+    categoryLabels.indexOf(category) === index &&
+    budgetKindForCategory(category) === 'consumption' &&
+    category !== 'Överföring mellan konto' &&
+    category !== 'Okategoriserat' &&
+    !existing.has(category)
+  );
 }
 
 const completedMonth = (year: number, month: number, today: Date): boolean => {
@@ -535,10 +581,18 @@ function frequencyAnnualMultiplier(frequency: RecurringFrequency): number | null
   return null;
 }
 
-function relevantRecurringPriceChange(deltaCents: number, deltaPercent: number | null): boolean {
+function relevantRecurringPriceChange(
+  deltaCents: number,
+  deltaPercent: number | null,
+  amountStabilityRatio: number
+): boolean {
+  if (deltaPercent == null || amountStabilityRatio < 0.6) return false;
   const absoluteDelta = Math.abs(deltaCents);
-  return absoluteDelta >= 2_000 ||
-    (absoluteDelta >= 1_000 && deltaPercent != null && Math.abs(deltaPercent) >= 10);
+  const absolutePercent = Math.abs(deltaPercent);
+  if (amountStabilityRatio >= 0.8) {
+    return absoluteDelta >= 2_000 && absolutePercent >= 10;
+  }
+  return absoluteDelta >= 5_000 && absolutePercent >= 10;
 }
 
 function recurringConfidenceRank(confidence: RecurringConfidence): number {
@@ -689,7 +743,11 @@ function deriveRecurringExpenseInsights(
       comparisonMedianCents,
       deltaFromMedianCents,
       deltaPercent,
-      hasRelevantPriceChange: relevantRecurringPriceChange(deltaFromMedianCents, deltaPercent),
+      hasRelevantPriceChange: relevantRecurringPriceChange(
+        deltaFromMedianCents,
+        deltaPercent,
+        amountStabilityRatio
+      ),
       hasStablePriceHistory: amountStabilityRatio >= 0.6,
       amountStabilityRatio,
       intervalRegularityRatio,
@@ -956,6 +1014,19 @@ export function buildFinancialHealthSummary(input: {
 
   if (input.monthlyInsights?.status === 'available') {
     const monthly = input.monthlyInsights;
+    const visibleMonthlyIncreases = monthly.biggestIncreases
+      .slice(0, 3)
+      .filter((change) => !handledMonthlyCategories.has(change.category));
+    const visibleMonthlyDecreases = monthly.biggestDecreases
+      .slice(0, 2)
+      .filter((change) => !handledMonthlyCategories.has(change.category));
+    const dominantCategoryChange = (
+      changes: MonthlyChangeInsight[],
+      totalDeltaCents: number
+    ) => Math.abs(totalDeltaCents) > 0 && changes.some((change) =>
+      Math.sign(change.deltaCents) === Math.sign(totalDeltaCents) &&
+      Math.abs(change.deltaCents) / Math.abs(totalDeltaCents) >= 0.7
+    );
     if (monthly.totalDeltaCents >= 50_000) {
       const percent = monthly.baselineTotalCents > 0
         ? monthly.totalDeltaCents / monthly.baselineTotalCents * 100
@@ -964,34 +1035,37 @@ export function buildFinancialHealthSummary(input: {
         monthly.totalDeltaCents >= 200_000 || (percent != null && percent >= 25)
           ? 'important'
           : 'attention';
-      candidates.push({
-        id: 'monthly-total-increase',
-        severity,
-        type: 'total-consumption-increase',
-        title: 'Konsumtionsutgifter',
-        summary: `${formatCurrencyFromCents(monthly.totalDeltaCents)} högre än normalt`,
-        amountCents: monthly.totalDeltaCents,
-        percent,
-        source: 'financial-summary',
-        priorityScore: healthPriority(severity, monthly.totalDeltaCents, percent),
-      });
+      if (!dominantCategoryChange(visibleMonthlyIncreases, monthly.totalDeltaCents)) {
+        candidates.push({
+          id: 'monthly-total-increase',
+          severity,
+          type: 'total-consumption-increase',
+          title: 'Konsumtionsutgifter',
+          summary: `${formatCurrencyFromCents(monthly.totalDeltaCents)} högre än normalt`,
+          amountCents: monthly.totalDeltaCents,
+          percent,
+          source: 'financial-summary',
+          priorityScore: healthPriority(severity, monthly.totalDeltaCents, percent),
+        });
+      }
     } else if (monthly.totalDeltaCents <= -50_000) {
-      candidates.push({
-        id: 'monthly-total-decrease',
-        severity: 'positive',
-        type: 'total-consumption-decrease',
-        title: 'Konsumtionsutgifter',
-        summary: `${formatCurrencyFromCents(Math.abs(monthly.totalDeltaCents))} lägre än normalt`,
-        amountCents: Math.abs(monthly.totalDeltaCents),
-        percent: monthly.baselineTotalCents > 0
-          ? Math.abs(monthly.totalDeltaCents / monthly.baselineTotalCents * 100)
-          : null,
-        source: 'financial-summary',
-        priorityScore: healthPriority('positive', monthly.totalDeltaCents),
-      });
+      if (!dominantCategoryChange(visibleMonthlyDecreases, monthly.totalDeltaCents)) {
+        candidates.push({
+          id: 'monthly-total-decrease',
+          severity: 'positive',
+          type: 'total-consumption-decrease',
+          title: 'Konsumtionsutgifter',
+          summary: `${formatCurrencyFromCents(Math.abs(monthly.totalDeltaCents))} lägre än normalt`,
+          amountCents: Math.abs(monthly.totalDeltaCents),
+          percent: monthly.baselineTotalCents > 0
+            ? Math.abs(monthly.totalDeltaCents / monthly.baselineTotalCents * 100)
+            : null,
+          source: 'financial-summary',
+          priorityScore: healthPriority('positive', monthly.totalDeltaCents),
+        });
+      }
     }
-    for (const change of monthly.biggestIncreases.slice(0, 3)) {
-      if (handledMonthlyCategories.has(change.category)) continue;
+    for (const change of visibleMonthlyIncreases) {
       const severity: FinancialHealthSeverity =
         change.deltaCents >= 100_000 ||
         (change.deltaPercent != null && change.deltaPercent >= 50 && change.deltaCents >= 50_000)
@@ -1009,8 +1083,7 @@ export function buildFinancialHealthSummary(input: {
         priorityScore: healthPriority(severity, change.deltaCents, change.deltaPercent),
       });
     }
-    for (const change of monthly.biggestDecreases.slice(0, 2)) {
-      if (handledMonthlyCategories.has(change.category)) continue;
+    for (const change of visibleMonthlyDecreases) {
       candidates.push({
         id: `monthly-decrease-${change.category}`,
         severity: 'positive',
@@ -1313,6 +1386,16 @@ export function buildMonthlyInsights(
     };
   }).sort((left, right) => left.category.localeCompare(right.category, 'sv-SE'));
   const relevantChanges = categoryChanges.filter(isRelevantMonthlyChange);
+  const activeHistoricalMonthsByCategory = new Map(
+    [...categories].map((category) => [
+      category,
+      baselineMonths.filter((key) =>
+        (historicalByMonth.get(key) ?? []).some((transaction) =>
+          transaction.category === category && consumptionAmount(transaction) !== 0
+        )
+      ).length,
+    ])
+  );
   const biggestIncreases = relevantChanges
     .filter((change) => change.deltaCents > 0)
     .sort((left, right) =>
@@ -1320,7 +1403,12 @@ export function buildMonthlyInsights(
     )
     .slice(0, 5);
   const biggestDecreases = relevantChanges
-    .filter((change) => change.deltaCents < 0)
+    .filter((change) =>
+      change.deltaCents < 0 &&
+      change.deltaPercent != null &&
+      Math.abs(change.deltaPercent) >= 10 &&
+      (activeHistoricalMonthsByCategory.get(change.category) ?? 0) >= 2
+    )
     .sort((left, right) =>
       left.deltaCents - right.deltaCents || left.category.localeCompare(right.category, 'sv-SE')
     )
@@ -1378,11 +1466,30 @@ export function buildMonthlyInsights(
 
 export function findLearnedTransactionType(
   merchant: string,
+  amountCents: number,
   rules: Array<{ merchantKey: string; transactionType: TransactionType }>
 ): TransactionType | undefined {
   const target = normalizedMerchantKey(merchant);
   if (!target || target === 'OKÄND MERCHANT') return undefined;
-  return rules.find((rule) => normalizedMerchantKey(rule.merchantKey) === target)?.transactionType;
+  const directionalTarget = transactionTypeRuleKey(merchant, amountCents);
+  const directionalRule = rules.find((rule) =>
+    rule.merchantKey.toLocaleUpperCase('sv-SE') === directionalTarget
+  );
+  if (directionalRule) return directionalRule.transactionType;
+
+  const legacyRule = rules.find((rule) => normalizedMerchantKey(rule.merchantKey) === target);
+  if (!legacyRule) return undefined;
+  const legacyDirection = ['income', 'refund'].includes(legacyRule.transactionType)
+    ? 1
+    : ['expense', 'saving', 'amortization'].includes(legacyRule.transactionType)
+      ? -1
+      : 0;
+  return Math.sign(amountCents) === legacyDirection ? legacyRule.transactionType : undefined;
+}
+
+export function transactionTypeRuleKey(merchant: string, amountCents: number): string {
+  const direction = amountCents > 0 ? 'CREDIT' : amountCents < 0 ? 'DEBIT' : 'ZERO';
+  return `${direction}:${normalizedMerchantKey(merchant)}`;
 }
 
 export function findExactMerchantTransactionIds(
@@ -1394,6 +1501,18 @@ export function findExactMerchantTransactionIds(
   return transactions
     .filter((transaction) => normalizedMerchantKey(transaction.merchant) === target)
     .map((transaction) => String(transaction.id));
+}
+
+export function findExactMerchantTransactionIdsForType(
+  transactions: Array<{ id: string | number; merchant: string; amountCents: number }>,
+  merchant: string,
+  amountCents: number
+): string[] {
+  const direction = Math.sign(amountCents);
+  return findExactMerchantTransactionIds(
+    transactions.filter((transaction) => Math.sign(transaction.amountCents) === direction),
+    merchant
+  );
 }
 
 function comparisonTokens(raw: string): string[] {
@@ -1535,12 +1654,15 @@ export function needsCategoryDecision(
   transaction: {
     needsReview: boolean;
     categoryDecided: boolean;
+    category: string;
     transactionType?: TransactionType;
   },
   isPossibleDuplicate: boolean
 ): boolean {
   return transaction.needsReview ||
     transaction.transactionType === 'unclassified' ||
+    (transaction.transactionType !== undefined &&
+      !isCategoryTransactionTypeConsistent(transaction.category, transaction.transactionType)) ||
     (isPossibleDuplicate && !transaction.categoryDecided);
 }
 

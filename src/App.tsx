@@ -1,13 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { amountForCategoryFlow, buildBudgetAnalysis, buildFinancialHealthSummary, buildMonthlyInsights, buildRecurringCostTrendInsights, buildRecurringExpenseInsights, calculateFinancialSummary, createTransactionClassifier, findExactMerchantTransactionIds, findLearnedTransactionType, findPotentialDuplicateIds, formatCurrencyFromCents, getPeriodStatus, ikeaBarkarbyRules, internalTransferRule, isIncludedInOverview, needsCategoryDecision, normalizedMerchantKey, sortCategoriesByUsage, sumCategoryFlow, transactionsForCategoryFlow, transactionTypes, type BudgetRow, type RecurringExpenseInsight, type TransactionType } from './lib/finance';
+import { amountForCategoryFlow, availableConsumptionBudgetCategories, buildBudgetAnalysis, buildFinancialHealthSummary, buildMonthlyInsights, buildRecurringCostTrendInsights, buildRecurringExpenseInsights, calculateFinancialSummary, createTransactionClassifier, expectedTransactionTypeForCategory, filterTransactionsByDirection, findExactMerchantTransactionIds, findExactMerchantTransactionIdsForType, findLearnedTransactionType, findPotentialDuplicateIds, formatCurrencyFromCents, getPeriodStatus, ikeaBarkarbyRules, internalTransferRule, isCategoryTransactionTypeConsistent, isIncludedInOverview, needsCategoryDecision, normalizedMerchantKey, sortCategoriesByUsage, sumCategoryFlow, transactionTypeRuleKey, transactionsForCategoryFlow, transactionTypes, type BudgetRow, type RecurringExpenseInsight, type TransactionDirectionFilter, type TransactionType } from './lib/finance';
 import { parseMoneyToCents, parseWorkbookSheets, sha256Hex, unwrapExcelCellValue, type ImportIssue, type ImportResult, type ImportedBankTransaction } from './lib/bankImport';
 import { buildBulkConfirmation, buildRememberForwardConfirmation, createLatestRunGuard, getUserFacingError, importAnalysisPhaseText, importControlsDisabled, runConfirmedAction, runDatabaseInitialization, runSequentialFileImports, type ErrorContext, type FileImportOutcome } from './lib/releaseSafety';
 import { deepAnalysisInitiallyOpen, firstRunCopy, getDashboardMode, getDashboardSections, shiftMonth } from './lib/dashboardPresentation';
 
 type Tab = 'overview' | 'import' | 'review';
 type ReviewFilter = 'all' | 'pending' | 'checked';
+type ReviewControlFilter =
+  | 'all'
+  | 'duplicate'
+  | 'category-approved'
+  | 'unclassified'
+  | 'conflict'
+  | 'uncertain'
+  | 'checked';
+
+const REVIEW_PAGE_SIZE = 100;
 
 type Transaction = ImportedBankTransaction;
 
@@ -171,6 +181,7 @@ const rules = [
   { id: 'salary', match: 'SALARY', category: 'Lön', priority: 115 },
   { id: 'ellevio', match: 'ELLEVIO', category: 'Boende / El', priority: 80 },
   { id: 'vattenfall', match: 'VATTENFALL', category: 'Boende / El', priority: 80 },
+  { id: 'landshypotek', match: 'LANDSHYPOTEK', category: 'Boende / Ränta', priority: 130 },
   { id: 'fuel', match: 'CIRCLE K', category: 'Bil / Bränsle', priority: 80 },
   { id: 'okq8', match: 'OKQ8', category: 'Bil / Bränsle', priority: 80 },
   { id: 'preem', match: 'PREEM', category: 'Bil / Bränsle', priority: 80 },
@@ -236,6 +247,15 @@ export default function App() {
   const currentYear = today.getFullYear();
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const [reviewFilter, setReviewFilter] = useState<ReviewFilter>('pending');
+  const [reviewDirectionFilter, setReviewDirectionFilter] = useState<TransactionDirectionFilter>('all');
+  const [reviewDateFilter, setReviewDateFilter] = useState('');
+  const [reviewMerchantFilter, setReviewMerchantFilter] = useState('');
+  const [reviewMinAmount, setReviewMinAmount] = useState('');
+  const [reviewMaxAmount, setReviewMaxAmount] = useState('');
+  const [reviewCategoryFilter, setReviewCategoryFilter] = useState('all');
+  const [reviewTypeFilter, setReviewTypeFilter] = useState<'all' | TransactionType>('all');
+  const [reviewControlFilter, setReviewControlFilter] = useState<ReviewControlFilter>('all');
+  const [reviewPage, setReviewPage] = useState(1);
   const [showAllExpenseCategories, setShowAllExpenseCategories] = useState(false);
   const [showAllIncomeCategories, setShowAllIncomeCategories] = useState(false);
   const [dbStatus, setDbStatus] = useState('Ansluter till lokal databas');
@@ -260,6 +280,8 @@ export default function App() {
   const [selectedCategoryFlow, setSelectedCategoryFlow] = useState<'expense' | 'income'>('expense');
   const [budgets, setBudgets] = useState<Record<string, number>>({});
   const [budgetDrafts, setBudgetDrafts] = useState<Record<string, string>>({});
+  const [pendingBudgetCategories, setPendingBudgetCategories] = useState<string[]>([]);
+  const [budgetCategoryPickerOpen, setBudgetCategoryPickerOpen] = useState(false);
   const [budgetedMonthCount, setBudgetedMonthCount] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
   const [errorTechnicalDetails, setErrorTechnicalDetails] = useState('');
@@ -285,7 +307,11 @@ export default function App() {
     ]);
     return (transaction: { merchant: string; amountCents: number }) => ({
       ...classifyCategory(transaction),
-      transactionType: findLearnedTransactionType(transaction.merchant, learnedTransactionTypeRules),
+      transactionType: findLearnedTransactionType(
+        transaction.merchant,
+        transaction.amountCents,
+        learnedTransactionTypeRules
+      ),
     });
   }, [learnedRules, learnedTransactionTypeRules]);
 
@@ -349,6 +375,8 @@ export default function App() {
 
   useEffect(() => {
     if (!dbReady) return;
+    setPendingBudgetCategories([]);
+    setBudgetCategoryPickerOpen(false);
     let active = true;
     void Promise.all([
       invoke<Budget[]>('get_budgets', {
@@ -403,13 +431,123 @@ export default function App() {
       (selectedMonth === 'all' || row.date.slice(5, 7) === selectedMonth.padStart(2, '0')))
   ), [transactions, selectedYear, selectedMonth]);
   const duplicateIds = useMemo(() => findPotentialDuplicateIds(transactions), [transactions]);
-  const pendingReviewTransactions = reviewTransactions.filter((row) =>
-    needsCategoryDecision(row, duplicateIds.has(String(row.id)))
+  const reviewRows = useMemo(() => reviewTransactions.map((row) => ({
+    row,
+    needsCheck: needsCategoryDecision(row, duplicateIds.has(String(row.id))),
+  })), [reviewTransactions, duplicateIds]);
+  const pendingReviewTransactions = useMemo(
+    () => reviewRows.filter(({ needsCheck }) => needsCheck).map(({ row }) => row),
+    [reviewRows]
   );
-  const visibleReviewTransactions = reviewTransactions.filter((row) => {
-    const needsCheck = needsCategoryDecision(row, duplicateIds.has(String(row.id)));
-    return reviewFilter === 'all' || (reviewFilter === 'pending' ? needsCheck : !needsCheck);
-  });
+  const statusFilteredReviewTransactions = useMemo(() => reviewRows
+    .filter(({ needsCheck }) =>
+      reviewFilter === 'all' || (reviewFilter === 'pending' ? needsCheck : !needsCheck)
+    )
+    .map(({ row }) => row), [reviewRows, reviewFilter]);
+  const incomingReviewCount = useMemo(
+    () => filterTransactionsByDirection(statusFilteredReviewTransactions, 'incoming').length,
+    [statusFilteredReviewTransactions]
+  );
+  const outgoingReviewCount = useMemo(
+    () => filterTransactionsByDirection(statusFilteredReviewTransactions, 'outgoing').length,
+    [statusFilteredReviewTransactions]
+  );
+  const directionFilteredReviewTransactions = useMemo(
+    () => filterTransactionsByDirection(statusFilteredReviewTransactions, reviewDirectionFilter),
+    [statusFilteredReviewTransactions, reviewDirectionFilter]
+  );
+  const filteredReviewTransactions = useMemo(() => {
+    const merchantQuery = reviewMerchantFilter.trim().toLocaleLowerCase('sv-SE');
+    const parsedMin = reviewMinAmount === ''
+      ? null
+      : Math.round(Number(reviewMinAmount.replace(',', '.')) * 100);
+    const parsedMax = reviewMaxAmount === ''
+      ? null
+      : Math.round(Number(reviewMaxAmount.replace(',', '.')) * 100);
+
+    return directionFilteredReviewTransactions.filter((row) => {
+      const rowId = String(row.id);
+      const category = categoryDrafts[rowId] ?? row.category;
+      const transactionType = transactionTypeDrafts[rowId] ?? row.transactionType;
+      const isDuplicate = duplicateIds.has(rowId);
+      const expectedType = expectedTransactionTypeForCategory(category);
+      const hasConflict = expectedType !== undefined && expectedType !== transactionType;
+      const isChecked = !isDuplicate &&
+        !row.needsReview &&
+        transactionType !== 'unclassified' &&
+        !hasConflict;
+      const matchesControl = reviewControlFilter === 'all' ||
+        (reviewControlFilter === 'duplicate' && isDuplicate) ||
+        (reviewControlFilter === 'category-approved' && isDuplicate && row.categoryDecided) ||
+        (reviewControlFilter === 'unclassified' && transactionType === 'unclassified') ||
+        (reviewControlFilter === 'conflict' && hasConflict) ||
+        (reviewControlFilter === 'uncertain' && row.needsReview) ||
+        (reviewControlFilter === 'checked' && isChecked);
+
+      return (!reviewDateFilter || row.date === reviewDateFilter) &&
+        (!merchantQuery || row.merchant.toLocaleLowerCase('sv-SE').includes(merchantQuery)) &&
+        (parsedMin === null || !Number.isFinite(parsedMin) || row.amountCents >= parsedMin) &&
+        (parsedMax === null || !Number.isFinite(parsedMax) || row.amountCents <= parsedMax) &&
+        (reviewCategoryFilter === 'all' || category === reviewCategoryFilter) &&
+        (reviewTypeFilter === 'all' || transactionType === reviewTypeFilter) &&
+        matchesControl;
+    });
+  }, [
+    directionFilteredReviewTransactions,
+    reviewDateFilter,
+    reviewMerchantFilter,
+    reviewMinAmount,
+    reviewMaxAmount,
+    reviewCategoryFilter,
+    reviewTypeFilter,
+    reviewControlFilter,
+    categoryDrafts,
+    transactionTypeDrafts,
+    duplicateIds,
+  ]);
+  const reviewPageCount = Math.max(1, Math.ceil(filteredReviewTransactions.length / REVIEW_PAGE_SIZE));
+  const visibleReviewTransactions = useMemo(() => {
+    const start = (reviewPage - 1) * REVIEW_PAGE_SIZE;
+    return filteredReviewTransactions.slice(start, start + REVIEW_PAGE_SIZE);
+  }, [filteredReviewTransactions, reviewPage]);
+
+  useEffect(() => {
+    setReviewPage(1);
+  }, [
+    reviewFilter,
+    reviewDirectionFilter,
+    reviewDateFilter,
+    reviewMerchantFilter,
+    reviewMinAmount,
+    reviewMaxAmount,
+    reviewCategoryFilter,
+    reviewTypeFilter,
+    reviewControlFilter,
+    selectedYear,
+    selectedMonth,
+  ]);
+  useEffect(() => {
+    setReviewPage((page) => Math.min(page, reviewPageCount));
+  }, [reviewPageCount]);
+
+  const clearReviewColumnFilters = () => {
+    setReviewDateFilter('');
+    setReviewMerchantFilter('');
+    setReviewMinAmount('');
+    setReviewMaxAmount('');
+    setReviewCategoryFilter('all');
+    setReviewTypeFilter('all');
+    setReviewControlFilter('all');
+  };
+  const hasReviewColumnFilters = Boolean(
+    reviewDateFilter ||
+    reviewMerchantFilter ||
+    reviewMinAmount ||
+    reviewMaxAmount ||
+    reviewCategoryFilter !== 'all' ||
+    reviewTypeFilter !== 'all' ||
+    reviewControlFilter !== 'all'
+  );
 
   const comparisonTransactions = useMemo(() => transactions.filter((row) =>
     validDate(row.date) && row.date.startsWith(`${comparisonYear}-`) &&
@@ -480,7 +618,8 @@ export default function App() {
     kind: 'consumption',
     year: Number(selectedYear),
     today,
-  }), [reportTransactions, yearTransactions, budgets, selectedYear, today]);
+    defaultCategories: pendingBudgetCategories,
+  }), [reportTransactions, yearTransactions, budgets, pendingBudgetCategories, selectedYear, today]);
   const incomeBudget = useMemo(() => buildBudgetAnalysis({
     periodTransactions: reportTransactions,
     yearTransactions,
@@ -542,6 +681,13 @@ export default function App() {
   ];
   const visibleExpenseRows = showAllExpenseCategories ? categoryRows : categoryRows.slice(0, 10);
   const visibleIncomeRows = showAllIncomeCategories ? incomeRows : incomeRows.slice(0, 10);
+  const availableBudgetCategories = useMemo(
+    () => availableConsumptionBudgetCategories(
+      categoryOptions,
+      categoryRows.map((row) => row.category)
+    ),
+    [categoryOptions, categoryRows]
+  );
 
   const monthlyComparison = useMemo(() => {
     const expensesByMonth = (year: string) => Array.from({ length: 12 }, (_, index) =>
@@ -789,6 +935,7 @@ export default function App() {
         amountCents,
       });
       setBudgets((current) => ({ ...current, [category]: amountCents }));
+      setPendingBudgetCategories((current) => current.filter((item) => item !== category));
       setBudgetedMonthCount(await invoke<number>('get_budget_coverage', {
         year: Number(selectedYear),
       }));
@@ -797,6 +944,16 @@ export default function App() {
     } catch (error) {
       showUserFacingError(error, 'budget-save');
     }
+  };
+
+  const addBudgetCategory = (category: string) => {
+    if (selectedMonth === 'all' || !availableBudgetCategories.includes(category)) return;
+    setPendingBudgetCategories((current) => [...current, category]);
+    setBudgetDrafts((current) => Object.prototype.hasOwnProperty.call(current, category)
+      ? current
+      : { ...current, [category]: '' });
+    setShowAllExpenseCategories(true);
+    setBudgetCategoryPickerOpen(false);
   };
 
   const clearCategoryDrafts = (ids: string[]) => {
@@ -814,7 +971,13 @@ export default function App() {
       });
       await refreshImportBatches();
       setTransactions((current) => current.map((item) => item.id === row.id
-        ? { ...item, category, needsReview: false, categoryDecided: true }
+        ? {
+            ...item,
+            category,
+            needsReview: item.transactionType === 'unclassified' ||
+              !isCategoryTransactionTypeConsistent(category, item.transactionType),
+            categoryDecided: true,
+          }
         : item));
       clearCategoryDrafts([String(row.id)]);
       setStatusMessage(`${category} valdes endast för ${row.merchant}.`);
@@ -844,7 +1007,13 @@ export default function App() {
           await refreshImportBatches();
           const matchingIdSet = new Set(transactionIds);
           setTransactions((current) => current.map((item) => matchingIdSet.has(String(item.id))
-            ? { ...item, category, needsReview: false, categoryDecided: true }
+            ? {
+                ...item,
+                category,
+                needsReview: item.transactionType === 'unclassified' ||
+                  !isCategoryTransactionTypeConsistent(category, item.transactionType),
+                categoryDecided: true,
+              }
             : item));
           clearCategoryDrafts(transactionIds);
           setStatusMessage(`${category} valdes för ${updatedCount} befintliga transaktioner med samma butik/mottagare.`);
@@ -879,7 +1048,13 @@ export default function App() {
           });
           await refreshImportBatches();
           setTransactions((current) => current.map((item) => item.id === row.id
-            ? { ...item, category, needsReview: false, categoryDecided: true }
+            ? {
+                ...item,
+                category,
+                needsReview: item.transactionType === 'unclassified' ||
+                  !isCategoryTransactionTypeConsistent(category, item.transactionType),
+                categoryDecided: true,
+              }
             : item));
           clearCategoryDrafts([String(row.id)]);
           setLearnedRules((current) => [
@@ -906,7 +1081,16 @@ export default function App() {
         transactionType,
       });
       setTransactions((current) => current.map((item) => item.id === row.id
-        ? { ...item, transactionType }
+        ? {
+            ...item,
+            transactionType,
+            needsReview: transactionType === 'unclassified' ||
+              !isCategoryTransactionTypeConsistent(item.category, transactionType)
+              ? true
+              : item.categoryDecided
+                ? false
+                : item.needsReview,
+          }
         : item));
       setTransactionTypeDrafts((current) => {
         const next = { ...current };
@@ -922,7 +1106,11 @@ export default function App() {
   };
 
   const updateSimilarTransactionTypes = async (row: Transaction, transactionType: TransactionType) => {
-    const ids = findExactMerchantTransactionIds(transactions, row.merchant);
+    const ids = findExactMerchantTransactionIdsForType(
+      transactions,
+      row.merchant,
+      row.amountCents
+    );
     await runConfirmedAction(
       window.confirm,
       buildBulkConfirmation({
@@ -938,7 +1126,16 @@ export default function App() {
             transactionType,
           });
           setTransactions((current) => current.map((item) => ids.includes(String(item.id))
-            ? { ...item, transactionType }
+            ? {
+                ...item,
+                transactionType,
+                needsReview: transactionType === 'unclassified' ||
+                  !isCategoryTransactionTypeConsistent(item.category, transactionType)
+                  ? true
+                  : item.categoryDecided
+                    ? false
+                    : item.needsReview,
+              }
             : item));
           setTransactionTypeDrafts((current) => {
             const next = { ...current };
@@ -946,7 +1143,7 @@ export default function App() {
             return next;
           });
           await refreshImportBatches();
-          setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för ${updated} befintliga transaktioner med samma butik/mottagare.`);
+          setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för ${updated} befintliga transaktioner med samma butik/mottagare och beloppsriktning.`);
           clearError();
         } catch (error) {
           showUserFacingError(error, 'review-update');
@@ -956,7 +1153,7 @@ export default function App() {
   };
 
   const rememberTransactionType = async (row: Transaction, transactionType: TransactionType) => {
-    const merchantKey = normalizedMerchantKey(row.merchant);
+    const merchantKey = transactionTypeRuleKey(row.merchant, row.amountCents);
     await runConfirmedAction(
       window.confirm,
       buildRememberForwardConfirmation({
@@ -972,7 +1169,16 @@ export default function App() {
             transactionType,
           });
           setTransactions((current) => current.map((item) => item.id === row.id
-            ? { ...item, transactionType }
+            ? {
+                ...item,
+                transactionType,
+                needsReview: transactionType === 'unclassified' ||
+                  !isCategoryTransactionTypeConsistent(item.category, transactionType)
+                  ? true
+                  : item.categoryDecided
+                    ? false
+                    : item.needsReview,
+              }
             : item));
           const savedRules = await invoke<LearnedTransactionTypeRule[]>('get_learned_transaction_type_rules');
           setLearnedTransactionTypeRules(savedRules);
@@ -982,7 +1188,7 @@ export default function App() {
             return next;
           });
           await refreshImportBatches();
-          setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för denna transaktion och används även för framtida importer från samma butik/mottagare.`);
+          setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för denna transaktion och används även för framtida importer från samma butik/mottagare med samma beloppsriktning.`);
           clearError();
         } catch (error) {
           showUserFacingError(error, 'review-update');
@@ -1528,6 +1734,30 @@ export default function App() {
             <article className="panel budget-panel">
               <div className="panel-header"><div><h3>Konsumtionsbudget mot utfall</h3><span>{selectedMonth === 'all' ? `Årsbudget ${selectedYear} · Du har angett månadsbudget för ${budgetedMonthCount} av årets 12 månader.` : `Månadsbudget · ${periodLabel}`}</span></div>{categoryRows.length > 10 && <button className="text-button" onClick={() => setShowAllExpenseCategories((show) => !show)}>{showAllExpenseCategories ? 'Visa färre' : `Visa alla ${categoryRows.length}`}</button>}</div>
               {selectedMonth === 'all' && <p className="budget-hint">Välj en månad för att ändra budget. Saknade budgetmånader fylls inte automatiskt med 0 kr.</p>}
+              {selectedMonth !== 'all' && availableBudgetCategories.length > 0 && (
+                <div className="budget-category-action">
+                  <button
+                    className="text-button"
+                    type="button"
+                    aria-expanded={budgetCategoryPickerOpen}
+                    onClick={() => setBudgetCategoryPickerOpen((open) => !open)}
+                  >
+                    + Lägg till budgetkategori
+                  </button>
+                  {budgetCategoryPickerOpen && (
+                    <select
+                      aria-label="Välj budgetkategori"
+                      defaultValue=""
+                      onChange={(event) => addBudgetCategory(event.target.value)}
+                    >
+                      <option value="" disabled>Välj kategori</option>
+                      {availableBudgetCategories.map((category) => (
+                        <option key={category} value={category}>{category}</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              )}
               <div className="category-table-wrap"><table className="category-table"><thead><tr><th>Kategori</th><th>Utfall</th><th>Budget</th><th>Kvar / över</th><th>Använt</th><th>Ändra budget</th></tr></thead><tbody>
                 {visibleExpenseRows.map((item) => <tr key={item.category}><td><button className="category-link" onClick={() => { setSelectedCategoryFlow('expense'); setSelectedCategory(item.category); }}>{item.category}</button></td><td>{periodStatus === 'future' ? '—' : formatMoney(item.actualCents)}</td><td>{item.hasBudget ? formatMoney(item.budgetCents) : 'Ej angiven'}</td><td className={periodStatus !== 'future' && item.hasBudget && item.actualCents > item.budgetCents ? 'over-budget' : ''}>{periodStatus !== 'future' && item.hasBudget ? formatMoney(item.remainingCents) : '—'}</td><td>{periodStatus === 'future' || item.percentUsed == null ? '—' : `${item.percentUsed.toLocaleString('sv-SE', { maximumFractionDigits: 1 })} %`}</td><td><div className="budget-editor"><input aria-label={`Budget ${item.category}`} type="number" min="0" step="100" disabled={selectedMonth === 'all'} value={budgetDrafts[item.category] ?? ''} placeholder="0" onChange={(event) => setBudgetDrafts((current) => ({ ...current, [item.category]: event.target.value }))} /><button disabled={selectedMonth === 'all'} onClick={() => void saveBudget(item.category)}>Spara</button></div></td></tr>)}
               </tbody></table></div>
@@ -1583,25 +1813,77 @@ export default function App() {
             <div className="panel-header">
               <div>
                 <h3>Alla transaktioner</h3>
-                <span>{periodLabel} · {visibleReviewTransactions.length} visas · {pendingReviewTransactions.length} behöver kontrolleras</span>
+                <span>{periodLabel} · {filteredReviewTransactions.length} matchar · {visibleReviewTransactions.length} visas · {pendingReviewTransactions.length} behöver kontrolleras</span>
               </div>
-              <label className="review-filter">
-                Visa
-                <select value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value as ReviewFilter)}>
-                  <option value="pending">Behöver kontrolleras ({pendingReviewTransactions.length})</option>
-                  <option value="checked">Kontrollerade ({reviewTransactions.length - pendingReviewTransactions.length})</option>
-                  <option value="all">Alla ({reviewTransactions.length})</option>
-                </select>
-              </label>
+              <div className="review-filters">
+                <label className="review-filter">
+                  Status
+                  <select value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value as ReviewFilter)}>
+                    <option value="pending">Behöver kontrolleras ({pendingReviewTransactions.length})</option>
+                    <option value="checked">Kontrollerade ({reviewTransactions.length - pendingReviewTransactions.length})</option>
+                    <option value="all">Alla ({reviewTransactions.length})</option>
+                  </select>
+                </label>
+                <label className="review-filter">
+                  Flöde
+                  <select value={reviewDirectionFilter} onChange={(event) => setReviewDirectionFilter(event.target.value as TransactionDirectionFilter)}>
+                    <option value="all">Alla ({statusFilteredReviewTransactions.length})</option>
+                    <option value="incoming">Intäkter / återbetalningar ({incomingReviewCount})</option>
+                    <option value="outgoing">Utgifter ({outgoingReviewCount})</option>
+                  </select>
+                </label>
+              </div>
             </div>
             <div className="review-explanation">
               <p><strong>Kategori</strong> beskriver vad köpet gäller, till exempel Mat eller Boende.</p>
               <p><strong>Ekonomisk typ</strong> bestämmer hur transaktionen påverkar Inkomster, Utgifter, Sparande och övriga beräkningar.</p>
             </div>
-            {visibleReviewTransactions.length ? (
+            {directionFilteredReviewTransactions.length || hasReviewColumnFilters ? (
               <div className="table-wrap">
                 <table>
-                  <thead><tr><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Ekonomisk typ</th><th>Kontroll</th><th>Åtgärd</th></tr></thead>
+                  <thead>
+                    <tr><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Ekonomisk typ</th><th>Kontroll</th><th>Åtgärd</th></tr>
+                    <tr className="table-filter-row">
+                      <th>
+                        <input aria-label="Filtrera på datum" type="date" value={reviewDateFilter} onChange={(event) => setReviewDateFilter(event.target.value)} />
+                      </th>
+                      <th>
+                        <input aria-label="Filtrera på beskrivning" type="search" placeholder="Sök beskrivning" value={reviewMerchantFilter} onChange={(event) => setReviewMerchantFilter(event.target.value)} />
+                      </th>
+                      <th>
+                        <div className="amount-filter">
+                          <input aria-label="Minsta belopp" type="number" step="0.01" placeholder="Min" value={reviewMinAmount} onChange={(event) => setReviewMinAmount(event.target.value)} />
+                          <input aria-label="Högsta belopp" type="number" step="0.01" placeholder="Max" value={reviewMaxAmount} onChange={(event) => setReviewMaxAmount(event.target.value)} />
+                        </div>
+                      </th>
+                      <th>
+                        <select aria-label="Filtrera på kategori" value={reviewCategoryFilter} onChange={(event) => setReviewCategoryFilter(event.target.value)}>
+                          <option value="all">Alla kategorier</option>
+                          {categoryOptions.map((category) => <option key={category} value={category}>{category}</option>)}
+                        </select>
+                      </th>
+                      <th>
+                        <select aria-label="Filtrera på ekonomisk typ" value={reviewTypeFilter} onChange={(event) => setReviewTypeFilter(event.target.value as 'all' | TransactionType)}>
+                          <option value="all">Alla typer</option>
+                          {transactionTypes.map((type) => <option key={type} value={type}>{transactionTypeLabels[type]}</option>)}
+                        </select>
+                      </th>
+                      <th>
+                        <select aria-label="Filtrera på kontrollstatus" value={reviewControlFilter} onChange={(event) => setReviewControlFilter(event.target.value as ReviewControlFilter)}>
+                          <option value="all">Alla kontroller</option>
+                          <option value="duplicate">Möjlig dublett</option>
+                          <option value="category-approved">Kategori godkänd</option>
+                          <option value="unclassified">Oklassificerad typ</option>
+                          <option value="conflict">Kategori och typ stämmer inte</option>
+                          <option value="uncertain">Osäker kategori</option>
+                          <option value="checked">Kontrollerad</option>
+                        </select>
+                      </th>
+                      <th>
+                        <button className="clear-filter-btn" disabled={!hasReviewColumnFilters} onClick={clearReviewColumnFilters}>Rensa</button>
+                      </th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {visibleReviewTransactions.map((row) => {
                       const rowId = String(row.id);
@@ -1610,7 +1892,14 @@ export default function App() {
                       const showCategoryDecision = (!row.categoryDecided && isDuplicate) || selectedCategory !== row.category;
                       const selectedTransactionType = transactionTypeDrafts[rowId] ?? row.transactionType;
                       const showTransactionTypeDecision = selectedTransactionType !== row.transactionType;
-                      const similarTransactionCount = findExactMerchantTransactionIds(transactions, row.merchant).length;
+                      const expectedTransactionType = expectedTransactionTypeForCategory(selectedCategory);
+                      const hasSemanticConflict = expectedTransactionType !== undefined &&
+                        expectedTransactionType !== selectedTransactionType;
+                      const similarTransactionCount = findExactMerchantTransactionIdsForType(
+                        transactions,
+                        row.merchant,
+                        row.amountCents
+                      ).length;
                       return (
                         <tr key={row.id}>
                           <td>{row.date}</td>
@@ -1624,10 +1913,15 @@ export default function App() {
                             <select aria-label={`Ekonomisk typ för ${row.merchant}`} value={selectedTransactionType} onChange={(event) => setTransactionTypeDrafts((current) => ({ ...current, [rowId]: event.target.value as TransactionType }))}>
                               {transactionTypes.map((type) => <option key={type} value={type}>{transactionTypeLabels[type]}</option>)}
                             </select>
+                            {hasSemanticConflict && (
+                              <small className="review-guidance">
+                                Den här kategorin brukar vara {transactionTypeLabels[expectedTransactionType].toLocaleLowerCase('sv-SE')}. Välj ekonomisk typ för att slutföra granskningen.
+                              </small>
+                            )}
                             {showTransactionTypeDecision && (
                               <div className="category-decision-actions">
                                 <button onClick={() => void updateTransactionType(row, selectedTransactionType)}>Ändra bara den här</button>
-                                <button onClick={() => void updateSimilarTransactionTypes(row, selectedTransactionType)}>Ändra {similarTransactionCount} befintliga med samma butik/mottagare</button>
+                                <button onClick={() => void updateSimilarTransactionTypes(row, selectedTransactionType)}>Ändra {similarTransactionCount} befintliga med samma butik/mottagare och beloppsriktning</button>
                                 <button onClick={() => void rememberTransactionType(row, selectedTransactionType)}>Använd även för framtida importer</button>
                               </div>
                             )}
@@ -1635,20 +1929,39 @@ export default function App() {
                           <td>
                             {isDuplicate && <span className="duplicate-tag">Möjlig dublett</span>}
                             {isDuplicate && row.categoryDecided && <span className="clear-tag">Kategori godkänd</span>}
-                            {row.needsReview && <span className="review-tag">Osäker kategori</span>}
+                            {hasSemanticConflict
+                              ? <span className="review-tag">Kategori och typ stämmer inte</span>
+                              : row.needsReview && <span className="review-tag">Osäker kategori</span>}
                             {row.transactionType === 'unclassified' && <span className="review-tag">Oklassificerad typ</span>}
-                            {!isDuplicate && !row.needsReview && row.transactionType !== 'unclassified' && <span className="clear-tag">Kontrollerad</span>}
+                            {!isDuplicate && !row.needsReview && row.transactionType !== 'unclassified' && !hasSemanticConflict && <span className="clear-tag">Kontrollerad</span>}
                           </td>
                           <td><button className="delete-btn" onClick={() => void deleteTransaction(row)}>Ta bort</button></td>
                         </tr>
                       );
                     })}
+                    {!filteredReviewTransactions.length && (
+                      <tr>
+                        <td className="table-empty-filter" colSpan={7}>
+                          <span>Inga transaktioner matchar kolumnfiltren.</span>
+                          <button onClick={clearReviewColumnFilters}>Rensa kolumnfilter</button>
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
+                {filteredReviewTransactions.length > REVIEW_PAGE_SIZE && (
+                  <div className="table-pagination">
+                    <button disabled={reviewPage === 1} onClick={() => setReviewPage((page) => Math.max(1, page - 1))}>Föregående</button>
+                    <span>Sida {reviewPage} av {reviewPageCount}</span>
+                    <button disabled={reviewPage === reviewPageCount} onClick={() => setReviewPage((page) => Math.min(reviewPageCount, page + 1))}>Nästa</button>
+                  </div>
+                )}
               </div>
             ) : (
               <p className="empty-state">
-                {reviewFilter === 'pending'
+                {reviewDirectionFilter !== 'all'
+                  ? `Inga ${reviewDirectionFilter === 'incoming' ? 'intäkter eller återbetalningar' : 'utgifter'} matchar det valda statusfiltret.`
+                  : reviewFilter === 'pending'
                   ? 'Inga poster behöver kontrolleras i den här perioden.'
                   : reviewFilter === 'checked'
                     ? 'Inga kontrollerade poster i den här perioden.'

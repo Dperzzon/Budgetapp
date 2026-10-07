@@ -108,6 +108,48 @@ describe('bank workbook import validation', () => {
     });
   });
 
+  it('keeps a learned transfer category in review without a matching type rule', () => {
+    const result = parseWorkbookSheets([worksheet('Transactions', [
+      ['Date', 'Description', 'Amount'],
+      ['2026-01-01', 'OWN ACCOUNT', -500],
+    ])], 'bank.xlsx', 123, () => ({
+      category: 'Överföring mellan konto',
+      needsReview: false,
+      source: 'explicit-user-rule' as const,
+      ruleId: 'learned-0',
+    }));
+
+    expect(result.acceptedRows[0]).toMatchObject({
+      category: 'Överföring mellan konto',
+      transactionType: 'expense',
+      needsReview: true,
+    });
+    expect(result.warnings).toContainEqual(expect.objectContaining({
+      code: 'category-type-conflict',
+      rowNumber: 2,
+    }));
+  });
+
+  it('accepts matching learned category and type rules without review', () => {
+    const result = parseWorkbookSheets([worksheet('Transactions', [
+      ['Date', 'Description', 'Amount'],
+      ['2026-01-01', 'OWN ACCOUNT', -500],
+    ])], 'bank.xlsx', 123, () => ({
+      category: 'Överföring mellan konto',
+      needsReview: false,
+      source: 'explicit-user-rule' as const,
+      ruleId: 'learned-0',
+      transactionType: 'transfer',
+    }));
+
+    expect(result.acceptedRows[0]).toMatchObject({
+      category: 'Överföring mellan konto',
+      transactionType: 'transfer',
+      needsReview: false,
+    });
+    expect(result.warnings).toEqual([]);
+  });
+
   it('reports an invalid amount instead of converting it to zero', () => {
     const result = parse([worksheet('Transactions', [
       ['Date', 'Description', 'Amount'],

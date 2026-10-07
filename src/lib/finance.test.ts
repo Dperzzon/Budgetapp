@@ -7,12 +7,15 @@ import {
   buildRecurringCostTrendInsights,
   buildRecurringExpenseInsights,
   amountForCategoryFlow,
+  availableConsumptionBudgetCategories,
   calculateCategoryTotals,
   calculateFinancialSummary,
   categoriesWithExpenses,
   classifyTransaction,
   createTransactionClassifier,
+  filterTransactionsByDirection,
   findExactMerchantTransactionIds,
+  findExactMerchantTransactionIdsForType,
   findLearnedTransactionType,
   findPotentialDuplicateIds,
   findSameMerchantTransactionIds,
@@ -21,6 +24,7 @@ import {
   hasBankTransactionHeaders,
   getCoveredMonths,
   inferTransactionType,
+  isCategoryTransactionTypeConsistent,
   isRelevantMonthlyChange,
   ikeaBarkarbyRules,
   internalTransferRule,
@@ -32,6 +36,7 @@ import {
   parseExcelDate,
   sortCategoriesByUsage,
   sumCategoryFlow,
+  transactionTypeRuleKey,
   transactionsForCategory,
     transactionsForCategoryFlow,
   toDuplicateKey,
@@ -159,6 +164,22 @@ describe('budget correctness', () => {
       remainingCents: 500000,
       percentUsed: 0,
     });
+  });
+
+  it('offers only consumption categories that are not already in the budget table', () => {
+    expect(availableConsumptionBudgetCategories(
+      [
+        'Mat',
+        'Transport',
+        'Mat',
+        'Lön',
+        'Sparande',
+        'Sparande / Amortering',
+        'Överföring mellan konto',
+        'Okategoriserat',
+      ],
+      ['Transport']
+    )).toEqual(['Mat']);
   });
 
   it('nets refunds and excludes non-consumption transaction types', () => {
@@ -289,8 +310,39 @@ describe('merchant normalization', () => {
   it('finds a learned type only for the exact normalized Swish direction', () => {
     const rules = [{ merchantKey: 'SWISH MOTTAGET', transactionType: 'income' as const }];
 
-    expect(findLearnedTransactionType('Mottagen +46700987654', rules)).toBe('income');
-    expect(findLearnedTransactionType('Swish betalning +46700987654', rules)).toBeUndefined();
+    expect(findLearnedTransactionType('Mottagen +46700987654', 50000, rules)).toBe('income');
+    expect(findLearnedTransactionType('Mottagen +46700987654', -50000, rules)).toBeUndefined();
+    expect(findLearnedTransactionType('Swish betalning +46700987654', 50000, rules)).toBeUndefined();
+  });
+
+  it('keeps positive and negative merchant matches separate for type changes', () => {
+    const transactions = [
+      { id: 1, merchant: 'KJELL & CO', amountCents: 26990 },
+      { id: 2, merchant: 'KJELL & CO', amountCents: -109900 },
+      { id: 3, merchant: 'KJELL & CO', amountCents: 49900 },
+    ];
+
+    expect(findExactMerchantTransactionIdsForType(
+      transactions,
+      transactions[0].merchant,
+      transactions[0].amountCents
+    )).toEqual(['1', '3']);
+    expect(transactionTypeRuleKey('KJELL & CO', 26990)).toBe('CREDIT:KJELL & CO');
+    expect(findLearnedTransactionType('KJELL & CO', -109900, [
+      { merchantKey: 'CREDIT:KJELL & CO', transactionType: 'refund' },
+    ])).toBeUndefined();
+  });
+
+  it('filters review transactions by incoming and outgoing amounts', () => {
+    const transactions = [
+      { id: 1, amountCents: 5000 },
+      { id: 2, amountCents: -3000 },
+      { id: 3, amountCents: 0 },
+    ];
+
+    expect(filterTransactionsByDirection(transactions, 'incoming').map(({ id }) => id)).toEqual([1]);
+    expect(filterTransactionsByDirection(transactions, 'outgoing').map(({ id }) => id)).toEqual([2]);
+    expect(filterTransactionsByDirection(transactions, 'all')).toEqual(transactions);
   });
 
   it('groups merchant-family variants while excluding unrelated roots', () => {
@@ -729,6 +781,94 @@ describe('classification and summary', () => {
           expect(result.biggestDecreases.map(({ category, deltaCents }) => ({ category, deltaCents })))
             .toEqual([{ category: 'Transport', deltaCents: -40_000 }]);
         });
+
+        it('does not promote a category decrease based on one active historical month', () => {
+          const result = buildMonthlyInsights([
+            insightTransaction(1, '2026-04-10', 'Boende / Underhåll', -500_000),
+            insightTransaction(2, '2026-04-12', 'Mat', -10_000),
+            insightTransaction(3, '2026-05-12', 'Mat', -10_000),
+          ], 2026, 6, today);
+
+          expect(result.totalDeltaCents).toBeLessThan(0);
+          expect(result.categoryChanges).toContainEqual(expect.objectContaining({
+            category: 'Boende / Underhåll',
+            deltaCents: -250_000,
+          }));
+          expect(result.biggestDecreases).not.toContainEqual(expect.objectContaining({
+            category: 'Boende / Underhåll',
+          }));
+        });
+
+        it('keeps a decrease backed by at least two active historical months', () => {
+          const result = buildMonthlyInsights([
+            insightTransaction(1, '2026-01-10', 'Boende', -200_000),
+            insightTransaction(2, '2026-02-10', 'Boende', -210_000),
+            insightTransaction(3, '2026-03-10', 'Boende', -205_000),
+            insightTransaction(4, '2026-04-10', 'Boende', -120_000),
+          ], 2026, 4, today);
+
+          expect(result.biggestDecreases).toContainEqual(expect.objectContaining({
+            category: 'Boende',
+            currentCents: 120_000,
+            baselineCents: 205_000,
+            deltaCents: -85_000,
+          }));
+        });
+
+        it('requires a 10 percent decrease while leaving meaningful decreases visible', () => {
+          const small = buildMonthlyInsights([
+            insightTransaction(1, '2026-01-10', 'Mat', -1_000_000),
+            insightTransaction(2, '2026-02-10', 'Mat', -1_000_000),
+            insightTransaction(3, '2026-03-10', 'Mat', -990_000),
+          ], 2026, 3, today);
+          const largeAbsoluteButSmallPercent = buildMonthlyInsights([
+            insightTransaction(1, '2026-01-10', 'Boende', -10_000_000),
+            insightTransaction(2, '2026-02-10', 'Boende', -10_000_000),
+            insightTransaction(3, '2026-03-10', 'Boende', -9_900_000),
+          ], 2026, 3, today);
+          const meaningful = buildMonthlyInsights([
+            insightTransaction(1, '2026-01-10', 'Transport', -500_000),
+            insightTransaction(2, '2026-02-10', 'Transport', -500_000),
+            insightTransaction(3, '2026-03-10', 'Transport', -400_000),
+          ], 2026, 3, today);
+
+          expect(small.biggestDecreases).toEqual([]);
+          expect(largeAbsoluteButSmallPercent.biggestDecreases).toEqual([]);
+          expect(meaningful.biggestDecreases).toContainEqual(expect.objectContaining({
+            category: 'Transport',
+            deltaCents: -100_000,
+            deltaPercent: -20,
+          }));
+        });
+
+        it('does not apply the active-month requirement to category increases', () => {
+          const result = buildMonthlyInsights([
+            insightTransaction(1, '2026-04-10', 'Mat', -10_000),
+            insightTransaction(2, '2026-05-10', 'Mat', -10_000),
+            insightTransaction(3, '2026-06-10', 'Boende / Underhåll', -500_000),
+          ], 2026, 6, today);
+
+          expect(result.biggestIncreases).toContainEqual(expect.objectContaining({
+            category: 'Boende / Underhåll',
+            currentCents: 500_000,
+            baselineCents: 0,
+            deltaCents: 500_000,
+          }));
+        });
+
+        it('does not apply the decrease percentage floor to category increases', () => {
+          const result = buildMonthlyInsights([
+            insightTransaction(1, '2026-01-10', 'Mat', -500_000),
+            insightTransaction(2, '2026-02-10', 'Mat', -500_000),
+            insightTransaction(3, '2026-03-10', 'Mat', -600_000),
+          ], 2026, 3, today);
+
+          expect(result.biggestIncreases).toContainEqual(expect.objectContaining({
+            category: 'Mat',
+            deltaCents: 100_000,
+            deltaPercent: 20,
+          }));
+        });
       });
 
     const transaction = (
@@ -745,6 +885,48 @@ describe('classification and summary', () => {
       expect(inferTransactionType('Överföring mellan konto', 10000)).toBe('transfer');
       expect(inferTransactionType('Övrigt', -100)).toBe('expense');
       expect(inferTransactionType('Mat / Dagligvaror', 300)).toBe('unclassified');
+    });
+
+    it('requires intrinsic categories to match their explicit transaction types', () => {
+      expect(isCategoryTransactionTypeConsistent('Överföring mellan konto', 'transfer')).toBe(true);
+      expect(isCategoryTransactionTypeConsistent('Överföring mellan konto', 'expense')).toBe(false);
+      expect(isCategoryTransactionTypeConsistent('Sparande', 'saving')).toBe(true);
+      expect(isCategoryTransactionTypeConsistent('Sparande', 'expense')).toBe(false);
+      expect(isCategoryTransactionTypeConsistent('Sparande / Amortering', 'amortization')).toBe(true);
+      expect(isCategoryTransactionTypeConsistent('Sparande / Amortering', 'saving')).toBe(false);
+      for (const category of ['Lön', 'Bidrag', 'Uthyrning']) {
+        expect(isCategoryTransactionTypeConsistent(category, 'income')).toBe(true);
+        expect(isCategoryTransactionTypeConsistent(category, 'expense')).toBe(false);
+      }
+    });
+
+    it('allows ordinary categories to be expenses or refunds', () => {
+      expect(isCategoryTransactionTypeConsistent('Mat / Dagligvaror', 'expense')).toBe(true);
+      expect(isCategoryTransactionTypeConsistent('Mat / Dagligvaror', 'refund')).toBe(true);
+    });
+
+    it('keeps consumption unchanged until a transfer category also receives transfer type', () => {
+      const originalTransaction = {
+        category: 'Övrigt',
+        amountCents: -10_000,
+        transactionType: 'expense' as const,
+      };
+      const categoryChangedTransaction = {
+        category: 'Överföring mellan konto',
+        amountCents: -10_000,
+        transactionType: 'expense' as const,
+      };
+      const typeResolvedTransaction = {
+        ...categoryChangedTransaction,
+        transactionType: 'transfer' as const,
+      };
+      const original = calculateFinancialSummary([originalTransaction]);
+      const categoryChanged = calculateFinancialSummary([categoryChangedTransaction]);
+      const typeResolved = calculateFinancialSummary([typeResolvedTransaction]);
+
+      expect(original.consumptionExpensesCents).toBe(10_000);
+      expect(categoryChanged.consumptionExpensesCents).toBe(10_000);
+      expect(typeResolved.consumptionExpensesCents).toBe(0);
     });
 
     it('counts only explicit income as income', () => {
@@ -908,9 +1090,33 @@ describe('classification and summary', () => {
   });
 
   it('moves an approved duplicate category out of pending review', () => {
-    expect(needsCategoryDecision({ needsReview: false, categoryDecided: true }, true)).toBe(false);
-    expect(needsCategoryDecision({ needsReview: false, categoryDecided: false }, true)).toBe(true);
-    expect(needsCategoryDecision({ needsReview: true, categoryDecided: false }, false)).toBe(true);
+    expect(needsCategoryDecision({
+      needsReview: false,
+      categoryDecided: true,
+      category: 'Mat / Dagligvaror',
+      transactionType: 'expense',
+    }, true)).toBe(false);
+    expect(needsCategoryDecision({
+      needsReview: false,
+      categoryDecided: false,
+      category: 'Mat / Dagligvaror',
+      transactionType: 'expense',
+    }, true)).toBe(true);
+    expect(needsCategoryDecision({
+      needsReview: true,
+      categoryDecided: false,
+      category: 'Mat / Dagligvaror',
+      transactionType: 'expense',
+    }, false)).toBe(true);
+  });
+
+  it('keeps a semantic category and type conflict in pending review', () => {
+    expect(needsCategoryDecision({
+      needsReview: false,
+      categoryDecided: true,
+      category: 'Överföring mellan konto',
+      transactionType: 'expense',
+    }, false)).toBe(true);
   });
 
   it('orders categories by use and preserves the default order for ties', () => {
@@ -1142,7 +1348,56 @@ describe('recurring expense insights', () => {
       frequency: 'monthly',
       confidence: 'low',
       hasStablePriceHistory: false,
+      hasRelevantPriceChange: false,
     });
+  });
+
+  it('does not flag normal variation in an otherwise stable recurring cost', () => {
+    const result = buildRecurringExpenseInsights([
+      recurring(1, '2026-01-25', -398_000, 'LÅN'),
+      recurring(2, '2026-02-25', -402_000, 'LÅN'),
+      recurring(3, '2026-03-25', -397_000, 'LÅN'),
+      recurring(4, '2026-04-25', -405_000, 'LÅN'),
+      recurring(5, '2026-05-25', -400_500, 'LÅN'),
+    ], 2026, 5, today);
+
+    expect(result.insights[0]).toMatchObject({
+      amountStabilityRatio: 1,
+      hasRelevantPriceChange: false,
+    });
+  });
+
+  it('requires a larger price change for medium-stability recurring costs', () => {
+    const material = buildRecurringExpenseInsights([
+      recurring(1, '2026-01-25', -400_000, 'VARIABEL KOSTNAD'),
+      recurring(2, '2026-02-25', -400_000, 'VARIABEL KOSTNAD'),
+      recurring(3, '2026-03-25', -400_000, 'VARIABEL KOSTNAD'),
+      recurring(4, '2026-04-25', -480_000, 'VARIABEL KOSTNAD'),
+    ], 2026, 4, today);
+    const immaterial = buildRecurringExpenseInsights([
+      recurring(1, '2026-01-25', -400_000, 'VARIABEL KOSTNAD'),
+      recurring(2, '2026-02-25', -400_000, 'VARIABEL KOSTNAD'),
+      recurring(3, '2026-03-25', -400_000, 'VARIABEL KOSTNAD'),
+      recurring(4, '2026-04-25', -404_000, 'VARIABEL KOSTNAD'),
+    ], 2026, 4, today);
+
+    expect(material.insights[0]).toMatchObject({
+      amountStabilityRatio: 0.75,
+      hasRelevantPriceChange: true,
+    });
+    expect(immaterial.insights[0].hasRelevantPriceChange).toBe(false);
+  });
+
+  it('never shows latest price change for low-stability recurring costs', () => {
+    const result = buildRecurringExpenseInsights([
+      recurring(1, '2026-01-25', -300_000, 'LÅG STABILITET'),
+      recurring(2, '2026-02-25', -400_000, 'LÅG STABILITET'),
+      recurring(3, '2026-03-25', -500_000, 'LÅG STABILITET'),
+      recurring(4, '2026-04-25', -800_000, 'LÅG STABILITET'),
+    ], 2026, 4, today);
+
+    expect(result.insights[0].amountStabilityRatio).toBeLessThan(0.6);
+    expect(result.insights[0].hasRelevantPriceChange).toBe(false);
   });
 
   it('keeps exact normalized merchants together without first-token grouping', () => {
@@ -1385,6 +1640,105 @@ describe('recurring cost trend insights', () => {
           source: 'monthly-change',
         }),
       ]));
+    });
+
+    it('keeps the dominant category and removes the duplicated total increase', () => {
+      const monthlyInsights = {
+        status: 'available' as const,
+        baselineKind: 'historical-average' as const,
+        baselineLabel: 'Jämfört med snitt',
+        baselineMonthCount: 3,
+        currentTotalCents: 1_000_000,
+        baselineTotalCents: 500_000,
+        totalDeltaCents: 500_000,
+        categoryChanges: [],
+        biggestIncreases: [{
+          category: 'Mat',
+          currentCents: 700_000,
+          baselineCents: 300_000,
+          deltaCents: 400_000,
+          deltaPercent: 133.33,
+        }],
+        biggestDecreases: [],
+        unusualTransactions: [],
+        topMerchants: [],
+      };
+
+      const result = buildFinancialHealthSummary({ ...baseInput(), monthlyInsights });
+
+      expect(result.insights).toContainEqual(expect.objectContaining({
+        id: 'monthly-increase-Mat',
+      }));
+      expect(result.insights).not.toContainEqual(expect.objectContaining({
+        id: 'monthly-total-increase',
+      }));
+    });
+
+    it('keeps the total increase when change is distributed across categories', () => {
+      const changes = [
+        ['Mat', 150_000],
+        ['Transport', 150_000],
+        ['Nöjen', 100_000],
+        ['Övrigt', 100_000],
+      ] as const;
+      const monthlyInsights = {
+        status: 'available' as const,
+        baselineKind: 'historical-average' as const,
+        baselineLabel: 'Jämfört med snitt',
+        baselineMonthCount: 3,
+        currentTotalCents: 1_000_000,
+        baselineTotalCents: 500_000,
+        totalDeltaCents: 500_000,
+        categoryChanges: [],
+        biggestIncreases: changes.map(([category, deltaCents]) => ({
+          category,
+          currentCents: deltaCents,
+          baselineCents: 0,
+          deltaCents,
+          deltaPercent: null,
+        })),
+        biggestDecreases: [],
+        unusualTransactions: [],
+        topMerchants: [],
+      };
+
+      const result = buildFinancialHealthSummary({ ...baseInput(), monthlyInsights });
+
+      expect(result.insights).toContainEqual(expect.objectContaining({
+        id: 'monthly-total-increase',
+      }));
+    });
+
+    it('keeps the dominant category and removes the duplicated total decrease', () => {
+      const monthlyInsights = {
+        status: 'available' as const,
+        baselineKind: 'historical-average' as const,
+        baselineLabel: 'Jämfört med snitt',
+        baselineMonthCount: 3,
+        currentTotalCents: 500_000,
+        baselineTotalCents: 1_000_000,
+        totalDeltaCents: -500_000,
+        categoryChanges: [],
+        biggestIncreases: [],
+        biggestDecreases: [{
+          category: 'Mat',
+          currentCents: 300_000,
+          baselineCents: 700_000,
+          deltaCents: -400_000,
+          deltaPercent: -57.14,
+        }],
+        unusualTransactions: [],
+        topMerchants: [],
+      };
+
+      const result = buildFinancialHealthSummary({ ...baseInput(), monthlyInsights });
+
+      expect(result.insights).toContainEqual(expect.objectContaining({
+        id: 'monthly-decrease-Mat',
+      }));
+      expect(result.insights).not.toContainEqual(expect.objectContaining({
+        id: 'monthly-total-decrease',
+      }));
     });
 
     it('lets a long-term merchant trend replace the latest-price signal', () => {

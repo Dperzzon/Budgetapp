@@ -5,9 +5,14 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 const CENTS_EPSILON: f64 = 1e-7;
 const MAX_SAFE_CENTS: i64 = 9_007_199_254_740_991;
+const LANDSHYPOTEK_AMORTIZATION_CENTS: i64 = 3_500_000;
+const LANDSHYPOTEK_MERCHANT: &str = "LANDSHYPOTEK";
+const LANDSHYPOTEK_AMORTIZATION_MERCHANT: &str = "LANDSHYPOTEK - AMORTERING";
+const INTEREST_CATEGORY: &str = "Boende / Ränta";
+const AMORTIZATION_CATEGORY: &str = "Sparande / Amortering";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +88,7 @@ struct StoredTransaction {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CategoryBudget {
     category: String,
     amount_cents: i64,
@@ -627,6 +633,46 @@ fn migration_4_to_5(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migration_5_to_6(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO transactions (
+            merchant, amount_cents, category, transaction_type, date, source_file,
+            needs_review, category_decided, created_at, import_batch_id,
+            imported_sheet, imported_row
+         )
+         SELECT
+            ?1, -?2, ?3, 'amortization', date, source_file,
+            0, 1, created_at, import_batch_id, imported_sheet, imported_row
+         FROM transactions
+         WHERE TRIM(merchant) = ?4 COLLATE NOCASE
+           AND amount_cents < -?2
+           AND transaction_type = 'expense'",
+        params![
+            LANDSHYPOTEK_AMORTIZATION_MERCHANT,
+            LANDSHYPOTEK_AMORTIZATION_CENTS,
+            AMORTIZATION_CATEGORY,
+            LANDSHYPOTEK_MERCHANT
+        ],
+    )?;
+    tx.execute(
+        "UPDATE transactions
+         SET amount_cents = amount_cents + ?1,
+             category = ?2,
+             transaction_type = 'expense',
+             needs_review = 0,
+             category_decided = 1
+         WHERE TRIM(merchant) = ?3 COLLATE NOCASE
+           AND amount_cents < -?1
+           AND transaction_type = 'expense'",
+        params![
+            LANDSHYPOTEK_AMORTIZATION_CENTS,
+            INTEREST_CATEGORY,
+            LANDSHYPOTEK_MERCHANT
+        ],
+    )?;
+    Ok(())
+}
+
 fn run_migration_step<F>(
     conn: &mut Connection,
     target_version: i64,
@@ -668,6 +714,10 @@ fn migrate_database(conn: &mut Connection) -> Result<(), String> {
     }
     if version == 4 {
         run_migration_step(conn, 5, migration_4_to_5)?;
+        version = 5;
+    }
+    if version == 5 {
+        run_migration_step(conn, 6, migration_5_to_6)?;
     }
 
     let migrated_version = schema_version(conn)?;
@@ -1070,9 +1120,9 @@ fn import_transactions_as_batch(
             .prepare(
                 "INSERT INTO transactions (
                     merchant, amount_cents, category, transaction_type, date, source_file, needs_review,
-                    import_batch_id, imported_sheet, imported_row, created_at
+                    category_decided, import_batch_id, imported_sheet, imported_row, created_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
             )
             .map_err(|error| error.to_string())?;
         for item in transactions {
@@ -1082,20 +1132,53 @@ fn import_transactions_as_batch(
             if item.amount_cents.unsigned_abs() > MAX_SAFE_CENTS as u64 {
                 return Err("Ett importbelopp är för stort för säker lagring.".to_string());
             }
+            let split_landshypotek = item.merchant.trim().eq_ignore_ascii_case(LANDSHYPOTEK_MERCHANT)
+                && item.amount_cents < -LANDSHYPOTEK_AMORTIZATION_CENTS
+                && item.transaction_type == TransactionType::Expense;
+            let amount_cents = if split_landshypotek {
+                item.amount_cents + LANDSHYPOTEK_AMORTIZATION_CENTS
+            } else {
+                item.amount_cents
+            };
+            let category = if split_landshypotek {
+                INTEREST_CATEGORY
+            } else {
+                &item.category
+            };
+            let needs_review = item.needs_review
+                || review_required_after_category_update(category, item.transaction_type);
             statement
                 .execute(params![
                     item.merchant,
-                    item.amount_cents,
-                    item.category,
+                    amount_cents,
+                    category,
                     item.transaction_type.as_str(),
                     item.date,
                     item.source_file,
-                    item.needs_review,
+                    if split_landshypotek { false } else { needs_review },
+                    split_landshypotek,
                     batch_id,
                     item.imported_sheet,
                     item.imported_row
                 ])
                 .map_err(|error| error.to_string())?;
+            if split_landshypotek {
+                statement
+                    .execute(params![
+                        LANDSHYPOTEK_AMORTIZATION_MERCHANT,
+                        -LANDSHYPOTEK_AMORTIZATION_CENTS,
+                        AMORTIZATION_CATEGORY,
+                        TransactionType::Amortization.as_str(),
+                        item.date,
+                        item.source_file,
+                        false,
+                        true,
+                        batch_id,
+                        item.imported_sheet,
+                        item.imported_row
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
         }
     }
     tx.commit().map_err(|error| error.to_string())?;
@@ -1119,6 +1202,49 @@ fn delete_batch(conn: &mut Connection, id: i64) -> Result<i64, String> {
     }
     tx.commit().map_err(|error| error.to_string())?;
     Ok(transaction_count)
+}
+
+fn expected_transaction_type_for_category(category: &str) -> Option<TransactionType> {
+    match category {
+        "Överföring mellan konto" => Some(TransactionType::Transfer),
+        "Sparande" => Some(TransactionType::Saving),
+        "Sparande / Amortering" => Some(TransactionType::Amortization),
+        "Lön" | "Bidrag" | "Uthyrning" => Some(TransactionType::Income),
+        _ => None,
+    }
+}
+
+fn is_category_transaction_type_consistent(
+    category: &str,
+    transaction_type: TransactionType,
+) -> bool {
+    expected_transaction_type_for_category(category)
+        .is_none_or(|expected| expected == transaction_type)
+}
+
+fn review_required_after_category_update(
+    category: &str,
+    transaction_type: TransactionType,
+) -> bool {
+    transaction_type == TransactionType::Unclassified
+        || !is_category_transaction_type_consistent(category, transaction_type)
+}
+
+fn review_required_after_type_update(
+    category: &str,
+    transaction_type: TransactionType,
+    current_needs_review: bool,
+    category_decided: bool,
+) -> bool {
+    if transaction_type == TransactionType::Unclassified
+        || !is_category_transaction_type_consistent(category, transaction_type)
+    {
+        true
+    } else if category_decided {
+        false
+    } else {
+        current_needs_review
+    }
 }
 
 #[tauri::command]
@@ -1163,10 +1289,22 @@ fn update_single_category(conn: &Connection, id: i64, category: &str) -> Result<
     if category.trim().is_empty() {
         return Err("Kategori får inte vara tom.".to_string());
     }
+    let transaction_type = conn
+        .query_row(
+            "SELECT transaction_type FROM transactions WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, TransactionType>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Transaktion {id} hittades inte."))?;
+    let needs_review = review_required_after_category_update(category, transaction_type);
     let updated = conn
         .execute(
-            "UPDATE transactions SET category = ?1, needs_review = 0, category_decided = 1 WHERE id = ?2",
-            params![category, id],
+            "UPDATE transactions
+             SET category = ?1, needs_review = ?2, category_decided = 1
+             WHERE id = ?3",
+            params![category, needs_review, id],
         )
         .map_err(|error| error.to_string())?;
     if updated != 1 {
@@ -1180,10 +1318,30 @@ fn update_single_transaction_type(
     id: i64,
     transaction_type: TransactionType,
 ) -> Result<(), String> {
+    let state = conn
+        .query_row(
+            "SELECT category, needs_review, category_decided
+             FROM transactions WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Transaktion {id} hittades inte."))?;
+    let needs_review =
+        review_required_after_type_update(&state.0, transaction_type, state.1, state.2);
     let updated = conn
         .execute(
-            "UPDATE transactions SET transaction_type = ?1 WHERE id = ?2",
-            params![transaction_type.as_str(), id],
+            "UPDATE transactions
+             SET transaction_type = ?1, needs_review = ?2
+             WHERE id = ?3",
+            params![transaction_type.as_str(), needs_review, id],
         )
         .map_err(|error| error.to_string())?;
     if updated != 1 {
@@ -1202,15 +1360,48 @@ fn bulk_update_types(
     }
     let tx = conn.transaction().map_err(|error| error.to_string())?;
     let mut updated = 0;
-    {
-        let mut statement = tx
-            .prepare("UPDATE transactions SET transaction_type = ?1 WHERE id = ?2")
+    let mut expected_direction = None;
+    for id in ids {
+        let state = tx
+            .query_row(
+                "SELECT category, needs_review, category_decided, SIGN(amount_cents)
+                 FROM transactions WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
             .map_err(|error| error.to_string())?;
-        for id in ids {
-            updated += statement
-                .execute(params![transaction_type.as_str(), id])
-                .map_err(|error| error.to_string())? as i64;
+        let Some((category, current_needs_review, category_decided, direction)) = state else {
+            return Err("En eller flera valda transaktioner hittades inte.".to_string());
+        };
+        if expected_direction.is_some_and(|expected| expected != direction) {
+            return Err(
+                "Inkommande och utgående transaktioner får inte massändras tillsammans."
+                    .to_string(),
+            );
         }
+        expected_direction = Some(direction);
+        let needs_review = review_required_after_type_update(
+            &category,
+            transaction_type,
+            current_needs_review,
+            category_decided,
+        );
+        updated += tx
+            .execute(
+                "UPDATE transactions
+                 SET transaction_type = ?1, needs_review = ?2
+                 WHERE id = ?3",
+                params![transaction_type.as_str(), needs_review, id],
+            )
+            .map_err(|error| error.to_string())? as i64;
     }
     if updated != ids.len() as i64 {
         return Err("En eller flera valda transaktioner hittades inte.".to_string());
@@ -1232,17 +1423,27 @@ fn bulk_update_categories(
     }
     let tx = conn.transaction().map_err(|error| error.to_string())?;
     let mut updated = 0;
-    {
-        let mut statement = tx
-            .prepare(
-                "UPDATE transactions SET category = ?1, needs_review = 0, category_decided = 1 WHERE id = ?2",
+    for id in ids {
+        let transaction_type = tx
+            .query_row(
+                "SELECT transaction_type FROM transactions WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, TransactionType>(0),
             )
+            .optional()
             .map_err(|error| error.to_string())?;
-        for id in ids {
-            updated += statement
-                .execute(params![category, id])
-                .map_err(|error| error.to_string())? as i64;
-        }
+        let Some(transaction_type) = transaction_type else {
+            return Err("En eller flera valda transaktioner hittades inte.".to_string());
+        };
+        let needs_review = review_required_after_category_update(category, transaction_type);
+        updated += tx
+            .execute(
+                "UPDATE transactions
+                 SET category = ?1, needs_review = ?2, category_decided = 1
+                 WHERE id = ?3",
+                params![category, needs_review, id],
+            )
+            .map_err(|error| error.to_string())? as i64;
     }
     tx.commit().map_err(|error| error.to_string())?;
     Ok(updated)
@@ -1360,15 +1561,29 @@ fn remember_transaction_type_choice(
         return Err("Merchant-nyckel får inte vara tom.".to_string());
     }
     let tx = conn.transaction().map_err(|error| error.to_string())?;
-    let updated = tx
-        .execute(
-            "UPDATE transactions SET transaction_type = ?1 WHERE id = ?2",
-            params![transaction_type.as_str(), id],
+    let amount_cents = tx
+        .query_row(
+            "SELECT amount_cents FROM transactions WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| error.to_string())?;
-    if updated != 1 {
-        return Err(format!("Transaktionen med id {id} hittades inte."));
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Transaktion {id} hittades inte."))?;
+    let expected_prefix = if amount_cents > 0 {
+        "CREDIT:"
+    } else if amount_cents < 0 {
+        "DEBIT:"
+    } else {
+        "ZERO:"
+    };
+    if !merchant_key
+        .to_ascii_uppercase()
+        .starts_with(expected_prefix)
+    {
+        return Err("Typregeln har fel beloppsriktning för transaktionen.".to_string());
     }
+    update_single_transaction_type(&tx, id, transaction_type)?;
     tx.execute(
         "INSERT INTO learned_transaction_type_rules (merchant_key, transaction_type)
          VALUES (?1, ?2)
@@ -1757,6 +1972,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preserved, "refund");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn migrates_existing_landshypotek_payments_into_interest_and_amortization() {
+        let path = temporary_database("landshypotek-history");
+        let mut conn = open_configured_connection(&path).unwrap();
+        run_migration_step(&mut conn, 1, migration_0_to_1).unwrap();
+        run_migration_step(&mut conn, 2, migration_1_to_2).unwrap();
+        run_migration_step(&mut conn, 3, migration_2_to_3).unwrap();
+        run_migration_step(&mut conn, 4, migration_3_to_4).unwrap();
+        run_migration_step(&mut conn, 5, migration_4_to_5).unwrap();
+        conn.execute(
+            "INSERT INTO transactions (
+                merchant, amount_cents, category, transaction_type, date, source_file,
+                needs_review, category_decided
+             ) VALUES (
+                'LANDSHYPOTEK', -4386000, 'Boende / Ränta', 'expense',
+                '2026-09-28', 'bank.xlsx', 0, 1
+             )",
+            (),
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = initialize_database(&path).expect("schema five should migrate");
+        let rows = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT merchant, amount_cents, category, transaction_type
+                     FROM transactions ORDER BY amount_cents",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    LANDSHYPOTEK_AMORTIZATION_MERCHANT.to_string(),
+                    -3_500_000,
+                    AMORTIZATION_CATEGORY.to_string(),
+                    "amortization".to_string(),
+                ),
+                (
+                    LANDSHYPOTEK_MERCHANT.to_string(),
+                    -886_000,
+                    INTEREST_CATEGORY.to_string(),
+                    "expense".to_string(),
+                ),
+            ]
+        );
         drop(conn);
         cleanup(&path);
     }
@@ -2201,6 +2481,45 @@ mod tests {
     }
 
     #[test]
+    fn transfer_category_conflict_stays_in_review_until_type_is_resolved() {
+        let path = temporary_database("single-transfer-conflict");
+        let conn = initialize_database(&path).unwrap();
+        let id = insert_transaction(&conn, "TRANSFER", "Okategoriserat");
+
+        update_single_category(&conn, id, "Överföring mellan konto").unwrap();
+
+        let after_category: (String, String, bool, bool) = conn
+            .query_row(
+                "SELECT category, transaction_type, needs_review, category_decided
+                 FROM transactions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after_category,
+            (
+                "Överföring mellan konto".to_string(),
+                "expense".to_string(),
+                true,
+                true
+            )
+        );
+
+        update_single_transaction_type(&conn, id, TransactionType::Transfer).unwrap();
+        let after_type: (String, bool) = conn
+            .query_row(
+                "SELECT transaction_type, needs_review FROM transactions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after_type, ("transfer".to_string(), false));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
     fn transaction_type_update_changes_only_the_selected_transaction() {
         let path = temporary_database("single-type");
         let conn = initialize_database(&path).unwrap();
@@ -2290,11 +2609,16 @@ mod tests {
         let mut conn = initialize_database(&path).unwrap();
         let selected = insert_transaction(&conn, "SWISH RECEIVED", "Övrigt");
         let historical_match = insert_transaction(&conn, "SWISH RECEIVED", "Övrigt");
+        conn.execute(
+            "UPDATE transactions SET amount_cents = 10000 WHERE id IN (?1, ?2)",
+            params![selected, historical_match],
+        )
+        .unwrap();
 
         remember_transaction_type_choice(
             &mut conn,
             selected,
-            "SWISH MOTTAGET",
+            "CREDIT:SWISH MOTTAGET",
             TransactionType::Income,
         )
         .unwrap();
@@ -2309,7 +2633,7 @@ mod tests {
         let rule: String = conn
             .query_row(
                 "SELECT transaction_type FROM learned_transaction_type_rules
-                 WHERE merchant_key = 'SWISH MOTTAGET'",
+                 WHERE merchant_key = 'CREDIT:SWISH MOTTAGET'",
                 (),
                 |row| row.get(0),
             )
@@ -2321,7 +2645,7 @@ mod tests {
         assert!(remember_transaction_type_choice(
             &mut conn,
             i64::MAX,
-            "SHOULD NOT EXIST",
+            "CREDIT:SHOULD NOT EXIST",
             TransactionType::Refund,
         )
         .is_err());
@@ -2406,6 +2730,38 @@ mod tests {
     }
 
     #[test]
+    fn bulk_type_update_rejects_mixed_amount_directions_atomically() {
+        let path = temporary_database("bulk-type-direction");
+        let mut conn = initialize_database(&path).unwrap();
+        let incoming = insert_transaction(&conn, "KJELL & CO", "Elektronik");
+        let outgoing = insert_transaction(&conn, "KJELL & CO", "Elektronik");
+        conn.execute(
+            "UPDATE transactions SET amount_cents = 26990 WHERE id = ?1",
+            params![incoming],
+        )
+        .unwrap();
+
+        let error = bulk_update_types(
+            &mut conn,
+            &[incoming, outgoing],
+            TransactionType::Refund,
+        )
+        .expect_err("mixed directions must be rejected");
+        let types: Vec<String> = conn
+            .prepare("SELECT transaction_type FROM transactions ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert!(error.contains("får inte massändras tillsammans"));
+        assert_eq!(types, vec!["expense", "expense"]);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
     fn bulk_type_update_is_atomic_when_a_row_fails() {
         let path = temporary_database("bulk-type-atomic");
         let mut conn = initialize_database(&path).unwrap();
@@ -2454,6 +2810,19 @@ mod tests {
         assert_eq!(values.get("Teknisk negativ"), Some(&-100));
         drop(conn);
         cleanup(&path);
+    }
+
+    #[test]
+    fn serializes_budget_contract_in_camel_case() {
+        let value = serde_json::to_value(CategoryBudget {
+            category: "Mat".to_string(),
+            amount_cents: 500_000,
+        })
+        .unwrap();
+
+        assert_eq!(value["category"], "Mat");
+        assert_eq!(value["amountCents"], 500_000);
+        assert!(value.get("amount_cents").is_none());
     }
 
     #[test]
@@ -2533,6 +2902,67 @@ mod tests {
     }
 
     #[test]
+    fn bulk_transfer_category_conflicts_stay_in_review_until_types_are_resolved() {
+        let path = temporary_database("bulk-transfer-conflict");
+        let mut conn = initialize_database(&path).unwrap();
+        let first = insert_transaction(&conn, "TRANSFER", "Okategoriserat");
+        let second = insert_transaction(&conn, "TRANSFER", "Okategoriserat");
+
+        bulk_update_categories(&mut conn, &[first, second], "Överföring mellan konto").unwrap();
+
+        let pending_after_category: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions
+                 WHERE id IN (?1, ?2) AND transaction_type = 'expense' AND needs_review = 1",
+                params![first, second],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_after_category, 2);
+
+        bulk_update_types(&mut conn, &[first, second], TransactionType::Transfer).unwrap();
+        let completed_after_type: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions
+                 WHERE id IN (?1, ?2) AND transaction_type = 'transfer' AND needs_review = 0",
+                params![first, second],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed_after_type, 2);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn remembered_transfer_category_without_type_rule_stays_in_review() {
+        let path = temporary_database("remember-transfer-conflict");
+        let mut conn = initialize_database(&path).unwrap();
+        let id = insert_transaction(&conn, "TRANSFER", "Okategoriserat");
+
+        remember_category_choice(&mut conn, id, "TRANSFER", "Överföring mellan konto").unwrap();
+
+        let stored: (String, String, bool) = conn
+            .query_row(
+                "SELECT category, transaction_type, needs_review
+                 FROM transactions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "Överföring mellan konto".to_string(),
+                "expense".to_string(),
+                true
+            )
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
     fn learned_rule_creation_does_not_change_history() {
         let path = temporary_database("future-rule");
         let conn = initialize_database(&path).unwrap();
@@ -2582,6 +3012,44 @@ mod tests {
         assert_eq!(detail.transactions[1].imported_row, Some(37));
         assert_eq!(detail.transactions[2].imported_row, Some(38));
         assert_eq!(list_batches(&conn).unwrap().len(), 1);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn splits_future_landshypotek_imports_without_changing_the_total() {
+        let path = temporary_database("landshypotek-import");
+        let mut conn = initialize_database(&path).unwrap();
+        let summary = import_transactions_as_batch(
+            &mut conn,
+            "bank.xlsx",
+            &"c".repeat(64),
+            vec![imported_transaction(
+                "LANDSHYPOTEK",
+                -4_400_300,
+                "2026-08-27",
+                "Transactions",
+                8,
+            )],
+        )
+        .unwrap();
+        let rows = get_batch_detail(&conn, summary.id).unwrap().transactions;
+
+        assert_eq!(summary.transaction_count, 2);
+        assert_eq!(summary.negative_total_cents, -4_400_300);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.merchant == LANDSHYPOTEK_MERCHANT
+                && row.amount_cents == -900_300
+                && row.category == INTEREST_CATEGORY
+                && row.transaction_type == TransactionType::Expense
+        }));
+        assert!(rows.iter().any(|row| {
+            row.merchant == LANDSHYPOTEK_AMORTIZATION_MERCHANT
+                && row.amount_cents == -3_500_000
+                && row.category == AMORTIZATION_CATEGORY
+                && row.transaction_type == TransactionType::Amortization
+        }));
         drop(conn);
         cleanup(&path);
     }
