@@ -134,6 +134,40 @@ export type RecurringCostTrendAnalysis = {
   decreasing: RecurringCostTrendInsight[];
 };
 
+export type FinancialHealthSeverity = 'positive' | 'info' | 'attention' | 'important';
+export type FinancialHealthSource =
+  | 'budget'
+  | 'monthly-change'
+  | 'recurring'
+  | 'cost-trend'
+  | 'classification'
+  | 'savings'
+  | 'financial-summary';
+
+export type FinancialHealthInsight = {
+  id: string;
+  severity: FinancialHealthSeverity;
+  type: string;
+  title: string;
+  summary: string;
+  supportingDetail?: string;
+  amountCents?: number;
+  percent?: number | null;
+  source: FinancialHealthSource;
+  priorityScore: number;
+};
+
+export type FinancialHealthSummary = {
+  status: 'good' | 'attention' | 'needs-review';
+  headline: string;
+  supportingText: string;
+  insights: FinancialHealthInsight[];
+  importantCount: number;
+  attentionCount: number;
+  positiveCount: number;
+  hiddenCount: number;
+};
+
 const incomeCategories = new Set(['Lön', 'Bidrag', 'Uthyrning']);
 
 export function inferTransactionType(
@@ -798,6 +832,328 @@ export function buildRecurringCostTrendInsights(
     trends,
     increasing,
     decreasing,
+  };
+}
+
+function healthPriority(
+  severity: FinancialHealthSeverity,
+  amountCents = 0,
+  percent: number | null = null,
+  highConfidence = false
+): number {
+  const base = severity === 'important'
+    ? 100
+    : severity === 'attention'
+      ? 70
+      : severity === 'info'
+        ? 40
+        : 30;
+  const amountPoints = Math.min(20, Math.floor(Math.abs(amountCents) / 50_000));
+  const percentPoints = percent == null
+    ? 0
+    : Math.min(10, Math.floor(Math.abs(percent) / 10));
+  return base + amountPoints + percentPoints + (highConfidence ? 10 : 0);
+}
+
+export function buildFinancialHealthSummary(input: {
+  financialSummary: FinancialSummary;
+  consumptionBudgetRows: BudgetRow[];
+  savingBudgetRows: BudgetRow[];
+  amortizationBudgetRows: BudgetRow[];
+  monthlyInsights: MonthlyInsights | null;
+  recurringInsights: RecurringExpenseAnalysis;
+  costTrends: RecurringCostTrendAnalysis;
+  isCurrentMonth: boolean;
+}): FinancialHealthSummary {
+  const candidates: FinancialHealthInsight[] = [];
+  const monthlyByCategory = new Map(
+    input.monthlyInsights?.status === 'available'
+      ? input.monthlyInsights.categoryChanges.map((change) => [change.category, change])
+      : []
+  );
+  const handledMonthlyCategories = new Set<string>();
+
+  for (const row of input.consumptionBudgetRows) {
+    if (!row.hasBudget || row.budgetCents <= 0) continue;
+    const differenceCents = row.actualCents - row.budgetCents;
+    const differencePercent = differenceCents / row.budgetCents * 100;
+    const monthly = monthlyByCategory.get(row.category);
+    if (
+      differenceCents >= 20_000 ||
+      (differenceCents >= 10_000 && differencePercent >= 10)
+    ) {
+      const severity: FinancialHealthSeverity =
+        differenceCents >= 100_000 ||
+        (differenceCents >= 20_000 && differencePercent >= 25)
+          ? 'important'
+          : 'attention';
+      const supportingDetail = monthly != null && monthly.deltaCents >= 20_000
+        ? `${formatCurrencyFromCents(monthly.deltaCents)} högre än normal nivå`
+        : undefined;
+      if (supportingDetail) handledMonthlyCategories.add(row.category);
+      candidates.push({
+        id: `budget-over-${row.category}`,
+        severity,
+        type: 'budget-overrun',
+        title: row.category,
+        summary: `${formatCurrencyFromCents(differenceCents)} över budget`,
+        supportingDetail,
+        amountCents: differenceCents,
+        percent: differencePercent,
+        source: 'budget',
+        priorityScore: healthPriority(severity, differenceCents, differencePercent),
+      });
+    } else if (
+      !input.isCurrentMonth &&
+      differenceCents <= -50_000 &&
+      Math.abs(differencePercent) >= 10
+    ) {
+      const supportingDetail = monthly != null && monthly.deltaCents <= -20_000
+        ? `${formatCurrencyFromCents(Math.abs(monthly.deltaCents))} lägre än normal nivå`
+        : undefined;
+      if (supportingDetail) handledMonthlyCategories.add(row.category);
+      candidates.push({
+        id: `budget-under-${row.category}`,
+        severity: 'positive',
+        type: 'budget-under',
+        title: row.category,
+        summary: `${formatCurrencyFromCents(Math.abs(differenceCents))} under budget`,
+        supportingDetail,
+        amountCents: Math.abs(differenceCents),
+        percent: Math.abs(differencePercent),
+        source: 'budget',
+        priorityScore: healthPriority('positive', differenceCents, differencePercent),
+      });
+    }
+  }
+
+  if (input.monthlyInsights?.status === 'available') {
+    const monthly = input.monthlyInsights;
+    if (monthly.totalDeltaCents >= 50_000) {
+      const percent = monthly.baselineTotalCents > 0
+        ? monthly.totalDeltaCents / monthly.baselineTotalCents * 100
+        : null;
+      const severity: FinancialHealthSeverity =
+        monthly.totalDeltaCents >= 200_000 || (percent != null && percent >= 25)
+          ? 'important'
+          : 'attention';
+      candidates.push({
+        id: 'monthly-total-increase',
+        severity,
+        type: 'total-consumption-increase',
+        title: 'Konsumtionsutgifter',
+        summary: `${formatCurrencyFromCents(monthly.totalDeltaCents)} högre än normalt`,
+        amountCents: monthly.totalDeltaCents,
+        percent,
+        source: 'financial-summary',
+        priorityScore: healthPriority(severity, monthly.totalDeltaCents, percent),
+      });
+    } else if (monthly.totalDeltaCents <= -50_000) {
+      candidates.push({
+        id: 'monthly-total-decrease',
+        severity: 'positive',
+        type: 'total-consumption-decrease',
+        title: 'Konsumtionsutgifter',
+        summary: `${formatCurrencyFromCents(Math.abs(monthly.totalDeltaCents))} lägre än normalt`,
+        amountCents: Math.abs(monthly.totalDeltaCents),
+        percent: monthly.baselineTotalCents > 0
+          ? Math.abs(monthly.totalDeltaCents / monthly.baselineTotalCents * 100)
+          : null,
+        source: 'financial-summary',
+        priorityScore: healthPriority('positive', monthly.totalDeltaCents),
+      });
+    }
+    for (const change of monthly.biggestIncreases.slice(0, 3)) {
+      if (handledMonthlyCategories.has(change.category)) continue;
+      const severity: FinancialHealthSeverity =
+        change.deltaCents >= 100_000 ||
+        (change.deltaPercent != null && change.deltaPercent >= 50 && change.deltaCents >= 50_000)
+          ? 'important'
+          : 'attention';
+      candidates.push({
+        id: `monthly-increase-${change.category}`,
+        severity,
+        type: 'category-increase',
+        title: change.category,
+        summary: `${formatCurrencyFromCents(change.deltaCents)} högre än normal nivå`,
+        amountCents: change.deltaCents,
+        percent: change.deltaPercent,
+        source: 'monthly-change',
+        priorityScore: healthPriority(severity, change.deltaCents, change.deltaPercent),
+      });
+    }
+    for (const change of monthly.biggestDecreases.slice(0, 2)) {
+      if (handledMonthlyCategories.has(change.category)) continue;
+      candidates.push({
+        id: `monthly-decrease-${change.category}`,
+        severity: 'positive',
+        type: 'category-decrease',
+        title: change.category,
+        summary: `${formatCurrencyFromCents(Math.abs(change.deltaCents))} lägre än normal nivå`,
+        amountCents: Math.abs(change.deltaCents),
+        percent: change.deltaPercent == null ? null : Math.abs(change.deltaPercent),
+        source: 'monthly-change',
+        priorityScore: healthPriority('positive', change.deltaCents, change.deltaPercent),
+      });
+    }
+    for (const transaction of monthly.unusualTransactions.slice(0, 2)) {
+      candidates.push({
+        id: `unusual-${transaction.id}`,
+        severity: Math.abs(transaction.amountCents) >= 500_000 ? 'attention' : 'info',
+        type: 'unusual-purchase',
+        title: 'Ovanligt stort köp',
+        summary: `${transaction.merchant} · ${formatCurrencyFromCents(Math.abs(transaction.amountCents))}`,
+        amountCents: Math.abs(transaction.amountCents),
+        source: 'monthly-change',
+        priorityScore: healthPriority(
+          Math.abs(transaction.amountCents) >= 500_000 ? 'attention' : 'info',
+          transaction.amountCents
+        ),
+      });
+    }
+  }
+
+  const addGoalInsights = (rows: BudgetRow[], title: string, source: FinancialHealthSource) => {
+    for (const row of rows) {
+      if (!row.hasBudget || row.budgetCents <= 0) continue;
+      const differenceCents = row.actualCents - row.budgetCents;
+      const differencePercent = differenceCents / row.budgetCents * 100;
+      if (
+        differenceCents >= 20_000 ||
+        (differenceCents >= 10_000 && differencePercent >= 10)
+      ) {
+        candidates.push({
+          id: `goal-over-${row.category}`,
+          severity: 'positive',
+          type: 'goal-over',
+          title,
+          summary: `${formatCurrencyFromCents(differenceCents)} över målet${input.isCurrentMonth ? ' hittills' : ''}`,
+          amountCents: differenceCents,
+          percent: differencePercent,
+          source,
+          priorityScore: healthPriority('positive', differenceCents, differencePercent),
+        });
+      } else if (
+        differenceCents <= -20_000 ||
+        (differenceCents <= -10_000 && differencePercent <= -10)
+      ) {
+        candidates.push({
+          id: `goal-under-${row.category}`,
+          severity: 'attention',
+          type: 'goal-under',
+          title,
+          summary: `${formatCurrencyFromCents(Math.abs(differenceCents))} under målet${input.isCurrentMonth ? ' hittills' : ''}`,
+          amountCents: Math.abs(differenceCents),
+          percent: Math.abs(differencePercent),
+          source,
+          priorityScore: healthPriority('attention', differenceCents, differencePercent),
+        });
+      }
+    }
+  };
+  addGoalInsights(input.savingBudgetRows, 'Sparmål', 'savings');
+  addGoalInsights(input.amortizationBudgetRows, 'Amorteringsmål', 'savings');
+
+  const trendMerchantKeys = new Set<string>();
+  for (const trend of input.costTrends.increasing) {
+    trendMerchantKeys.add(trend.merchantKey);
+    const severity: FinancialHealthSeverity =
+      trend.confidence === 'high' && trend.annualizedImpactCents >= 100_000
+        ? 'important'
+        : 'attention';
+    candidates.push({
+      id: `trend-${trend.merchantKey}`,
+      severity,
+      type: 'long-term-cost-increase',
+      title: trend.merchantLabel,
+      summary: `Typisk kostnadsnivå ${trend.deltaPercent?.toLocaleString('sv-SE', { maximumFractionDigits: 1 }) ?? '—'} % högre`,
+      supportingDetail: `Cirka ${formatCurrencyFromCents(trend.annualizedImpactCents)} mer per år`,
+      amountCents: trend.annualizedImpactCents,
+      percent: trend.deltaPercent,
+      source: 'cost-trend',
+      priorityScore: healthPriority(
+        severity,
+        trend.annualizedImpactCents,
+        trend.deltaPercent,
+        trend.confidence === 'high'
+      ),
+    });
+  }
+  for (const recurring of input.recurringInsights.insights) {
+    if (
+      trendMerchantKeys.has(recurring.merchantKey) ||
+      !recurring.hasRelevantPriceChange ||
+      recurring.deltaFromMedianCents <= 0
+    ) {
+      continue;
+    }
+    candidates.push({
+      id: `recurring-${recurring.merchantKey}`,
+      severity: recurring.confidence === 'low' ? 'info' : 'attention',
+      type: 'latest-price-increase',
+      title: recurring.merchantLabel,
+      summary: `Senaste betalningen är ${formatCurrencyFromCents(recurring.deltaFromMedianCents)} högre än tidigare normalnivå`,
+      amountCents: recurring.deltaFromMedianCents,
+      percent: recurring.deltaPercent,
+      source: 'recurring',
+      priorityScore: healthPriority(
+        recurring.confidence === 'low' ? 'info' : 'attention',
+        recurring.deltaFromMedianCents,
+        recurring.deltaPercent,
+        recurring.confidence === 'high'
+      ),
+    });
+  }
+
+  if (input.financialSummary.unclassifiedCount > 0) {
+    const count = input.financialSummary.unclassifiedCount;
+    const severity: FinancialHealthSeverity =
+      count >= 10 ? 'important' : count >= 3 ? 'attention' : 'info';
+    candidates.push({
+      id: 'unclassified',
+      severity,
+      type: 'unclassified',
+      title: `${count} transaktion${count === 1 ? '' : 'er'} behöver klassificeras`,
+      summary: 'Analysen blir mer komplett när ekonomisk typ har valts.',
+      source: 'classification',
+      priorityScore: healthPriority(severity) + Math.min(10, count),
+    });
+  }
+
+  const sorted = [...candidates].sort((left, right) =>
+    right.priorityScore - left.priorityScore || left.id.localeCompare(right.id, 'sv-SE')
+  );
+  const priorityInsights = sorted
+    .filter((insight) => insight.severity === 'important' || insight.severity === 'attention')
+    .slice(0, 4);
+  const supportingInsights = sorted
+    .filter((insight) => insight.severity === 'positive' || insight.severity === 'info')
+    .slice(0, 2);
+  const insights = [...priorityInsights, ...supportingInsights];
+  const importantCount = candidates.filter((insight) => insight.severity === 'important').length;
+  const attentionCount = candidates.filter((insight) => insight.severity === 'attention').length;
+  const positiveCount = candidates.filter((insight) => insight.severity === 'positive').length;
+  const status = importantCount > 0
+    ? 'needs-review'
+    : attentionCount > 0
+      ? 'attention'
+      : 'good';
+
+  return {
+    status,
+    headline: status === 'needs-review'
+      ? 'Flera tydliga förändringar behöver uppmärksamhet'
+      : status === 'attention'
+        ? 'Några saker att se över'
+        : 'Ekonomin ser stabil ut',
+    supportingText: status === 'good'
+      ? 'Inga större avvikelser hittades i den här perioden.'
+      : 'Prioriterat från budget, förändringar och återkommande kostnader.',
+    insights,
+    importantCount,
+    attentionCount,
+    positiveCount,
+    hiddenCount: Math.max(0, candidates.length - insights.length),
   };
 }
 

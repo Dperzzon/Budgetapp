@@ -141,6 +141,43 @@ annual delta
 
 No forecasting, inflation adjustment, or trend persistence is involved.
 
+## Financial health prioritization
+`buildFinancialHealthSummary` combines existing derived outputs; it performs no new financial analysis and persists nothing. Inputs are the current financial summary, consumption/saving/amortization budget rows, monthly insights, recurring insights, and recurring cost trends.
+
+Status is transparent:
+- `needs-review` when at least one important signal exists
+- `attention` when no important signal exists but at least one attention signal exists
+- `good` otherwise
+
+Positive signals never cancel negative signals. The internal priority score is used only for deterministic ordering:
+
+```text
+important base 100
+attention base 70
+info base 40
+positive base 30
+
++ up to 20 points: floor(abs(amount cents) / 50,000)
++ up to 10 points: floor(abs(percent) / 10)
++ 10 points for high-confidence recurring/trend evidence
+```
+
+Budget overruns are shown at 200 kr, or at 100 kr together with at least 10 percent over budget. They become important at 1,000 kr, or at 200 kr together with at least 25 percent over budget. Completed-month under-budget positives require at least 500 kr and 10 percent. Saving and amortization goal differences use 200 kr, or 100 kr together with 10 percent.
+
+Monthly total increases require at least 500 kr and become important at 2,000 kr or 25 percent. Existing Phase 2A category thresholds are reused; category increases become important at 1,000 kr, or at 500 kr together with 50 percent. Unusual purchases remain neutral information unless at least 5,000 kr.
+
+One or two unclassified transactions are informational, three through nine require attention, and ten or more are important. This severity concerns analysis completeness, not spending quality.
+
+Deduplication is deterministic:
+- a medium/high long-term merchant trend suppresses the same merchant's latest-payment increase
+- a budget overrun plus a same-direction monthly category increase becomes one budget card with supporting normal-level detail
+- a completed-month under-budget result plus a same-direction category decrease is combined similarly
+- total monthly change remains an overview signal while category cards explain causes
+
+At most four important/attention signals and two positive/info signals are returned. Within each group, priority score and stable ID determine order. The output reports how many additional details remain in the existing sections.
+
+The health summary is monthly. The year view asks the user to select a month. During the current month, Phase 2A full-month changes are unavailable by construction, while budget and goals to date, actual recurring charges, long-term trends, and classification completeness remain eligible.
+
 ## Budget calculations
 Derived budget rows are centralized in `finance.ts` and are never persisted. A row contains budget, actual, remaining amount, percentage used, historical monthly average, and an optional annual forecast. The row set is the union of categories with relevant actuals and categories with a saved budget, so a saved budget remains visible when actual is zero.
 

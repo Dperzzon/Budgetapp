@@ -128,6 +128,7 @@ The app currently supports:
 - transparent comparison labels based on earlier completed consumption months, with no full-month comparison for the current month
 - conservative recurring-expense insights with approximate frequency, payment evidence, median normal amount, cautious price-change signals, and annualized periodic cost
 - long-term recurring-cost trends based on earlier and recent period medians, with conservative confidence and annualized impact
+- a prioritized monthly financial-health summary that reuses budget, monthly-change, recurring, trend, savings, and classification signals without an opaque score
 - spending-by-month comparison, category budget-versus-actual, import source summaries, and transaction history
 - possible duplicate detection by date, merchant, and amount; duplicate rows are still imported and flagged for manual review
 - manual category changes and deletion for any transaction in the selected period

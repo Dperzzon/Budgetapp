@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildImportSummary,
   buildBudgetAnalysis,
+  buildFinancialHealthSummary,
   buildMonthlyInsights,
   buildRecurringCostTrendInsights,
   buildRecurringExpenseInsights,
@@ -1213,6 +1214,366 @@ describe('recurring cost trend insights', () => {
 
     expect(result.trends[0].trend).toBe('stable');
     expect(result.increasing).toEqual([]);
+  });
+
+  describe('financial health prioritization', () => {
+    const budgetRow = (
+      category: string,
+      budgetCents: number,
+      actualCents: number
+    ) => ({
+      category,
+      hasBudget: true,
+      budgetCents,
+      actualCents,
+      remainingCents: budgetCents - actualCents,
+      percentUsed: budgetCents > 0 ? actualCents / budgetCents * 100 : null,
+      historicalMonthlyAverageCents: null,
+      forecastAnnualCents: null,
+    });
+    const baseInput = () => ({
+      financialSummary: calculateFinancialSummary([]),
+      consumptionBudgetRows: [] as ReturnType<typeof budgetRow>[],
+      savingBudgetRows: [] as ReturnType<typeof budgetRow>[],
+      amortizationBudgetRows: [] as ReturnType<typeof budgetRow>[],
+      monthlyInsights: null,
+      recurringInsights: {
+        status: 'no-candidates' as const,
+        observedMonthCount: 6,
+        insights: [],
+      },
+      costTrends: {
+        status: 'available' as const,
+        trends: [],
+        increasing: [],
+        decreasing: [],
+      },
+      isCurrentMonth: false,
+    });
+
+    it('returns a transparent good status when there are no relevant signals', () => {
+      const result = buildFinancialHealthSummary(baseInput());
+
+      expect(result).toMatchObject({
+        status: 'good',
+        headline: 'Ekonomin ser stabil ut',
+        insights: [],
+        importantCount: 0,
+        attentionCount: 0,
+        positiveCount: 0,
+      });
+    });
+
+    it('creates important budget overrun and meaningful under-budget signals in cents', () => {
+      const over = buildFinancialHealthSummary({
+        ...baseInput(),
+        consumptionBudgetRows: [budgetRow('Mat', 500_000, 650_000)],
+      });
+      const under = buildFinancialHealthSummary({
+        ...baseInput(),
+        consumptionBudgetRows: [budgetRow('Mat', 500_000, 400_000)],
+      });
+
+      expect(over.insights[0]).toMatchObject({
+        severity: 'important',
+        amountCents: 150_000,
+        source: 'budget',
+        summary: '1 500,00 kr över budget',
+      });
+      expect(over.insights[0].priorityScore).toBeGreaterThanOrEqual(100);
+      expect(under.insights[0]).toMatchObject({
+        severity: 'positive',
+        amountCents: 100_000,
+        source: 'budget',
+        summary: '1 000,00 kr under budget',
+      });
+    });
+
+    it('maps large monthly increases to attention and decreases to positive', () => {
+      const monthlyInsights = {
+        status: 'available' as const,
+        baselineKind: 'historical-average' as const,
+        baselineLabel: 'Jämfört med snitt',
+        baselineMonthCount: 3,
+        currentTotalCents: 600_000,
+        baselineTotalCents: 550_000,
+        totalDeltaCents: 50_000,
+        categoryChanges: [],
+        biggestIncreases: [{
+          category: 'Mat',
+          currentCents: 300_000,
+          baselineCents: 200_000,
+          deltaCents: 100_000,
+          deltaPercent: 50,
+        }],
+        biggestDecreases: [{
+          category: 'Transport',
+          currentCents: 50_000,
+          baselineCents: 100_000,
+          deltaCents: -50_000,
+          deltaPercent: -50,
+        }],
+        unusualTransactions: [],
+        topMerchants: [],
+      };
+      const result = buildFinancialHealthSummary({ ...baseInput(), monthlyInsights });
+
+      expect(result.insights).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: 'monthly-increase-Mat',
+          severity: 'important',
+          source: 'monthly-change',
+        }),
+        expect.objectContaining({
+          id: 'monthly-decrease-Transport',
+          severity: 'positive',
+          source: 'monthly-change',
+        }),
+      ]));
+    });
+
+    it('lets a long-term merchant trend replace the latest-price signal', () => {
+      const recurring = {
+        merchantKey: 'NETFLIX',
+        merchantLabel: 'Netflix',
+        frequency: 'monthly' as const,
+        occurrences: 6,
+        activeMonths: 6,
+        monthsObserved: 6,
+        medianAmountCents: 16_400,
+        latestAmountCents: 17_900,
+        latestDate: '2026-06-25',
+        comparisonMedianCents: 14_900,
+        deltaFromMedianCents: 3_000,
+        deltaPercent: 20.13,
+        hasRelevantPriceChange: true,
+        hasStablePriceHistory: true,
+        amountStabilityRatio: 0.83,
+        intervalRegularityRatio: 1,
+        estimatedAnnualCostCents: 196_800,
+        confidence: 'high' as const,
+        firstSeen: '2026-01-25',
+        lastSeen: '2026-06-25',
+        occurrenceHistory: [],
+      };
+      const trend = {
+        merchantKey: 'NETFLIX',
+        merchantLabel: 'Netflix',
+        frequency: 'monthly' as const,
+        firstPeriodMedianCents: 14_900,
+        recentPeriodMedianCents: 17_900,
+        deltaCents: 3_000,
+        deltaPercent: 20.13,
+        trend: 'increasing' as const,
+        observations: 6,
+        monthsSpanned: 6,
+        amountStabilityRatio: 0.83,
+        directionConsistencyRatio: 0.6,
+        confidence: 'high' as const,
+        firstPeriodLabel: 'Första 2 betalningarna',
+        recentPeriodLabel: 'Senaste 2 betalningarna',
+        annualizedImpactCents: 36_000,
+      };
+      const result = buildFinancialHealthSummary({
+        ...baseInput(),
+        recurringInsights: { status: 'available', observedMonthCount: 6, insights: [recurring] },
+        costTrends: {
+          status: 'available',
+          trends: [trend],
+          increasing: [trend],
+          decreasing: [],
+        },
+      });
+
+      expect(result.insights.filter((insight) => insight.title === 'Netflix')).toHaveLength(1);
+      expect(result.insights[0]).toMatchObject({
+        type: 'long-term-cost-increase',
+        source: 'cost-trend',
+      });
+    });
+
+    it('keeps a latest-price signal when no long-term trend exists', () => {
+      const recurring = {
+        merchantKey: 'NETFLIX',
+        merchantLabel: 'Netflix',
+        frequency: 'monthly' as const,
+        occurrences: 5,
+        activeMonths: 5,
+        monthsObserved: 5,
+        medianAmountCents: 14_900,
+        latestAmountCents: 17_900,
+        latestDate: '2026-05-25',
+        comparisonMedianCents: 14_900,
+        deltaFromMedianCents: 3_000,
+        deltaPercent: 20.13,
+        hasRelevantPriceChange: true,
+        hasStablePriceHistory: true,
+        amountStabilityRatio: 0.8,
+        intervalRegularityRatio: 1,
+        estimatedAnnualCostCents: 178_800,
+        confidence: 'high' as const,
+        firstSeen: '2026-01-25',
+        lastSeen: '2026-05-25',
+        occurrenceHistory: [],
+      };
+      const result = buildFinancialHealthSummary({
+        ...baseInput(),
+        recurringInsights: { status: 'available', observedMonthCount: 5, insights: [recurring] },
+      });
+
+      expect(result.insights[0]).toMatchObject({
+        type: 'latest-price-increase',
+        source: 'recurring',
+      });
+    });
+
+    it('combines matching budget and monthly category evidence into one card', () => {
+      const monthlyChange = {
+        category: 'Mat',
+        currentCents: 650_000,
+        baselineCents: 500_000,
+        deltaCents: 150_000,
+        deltaPercent: 30,
+      };
+      const result = buildFinancialHealthSummary({
+        ...baseInput(),
+        consumptionBudgetRows: [budgetRow('Mat', 500_000, 650_000)],
+        monthlyInsights: {
+          status: 'available',
+          baselineKind: 'historical-average',
+          baselineLabel: 'Jämfört med snitt',
+          baselineMonthCount: 3,
+          currentTotalCents: 650_000,
+          baselineTotalCents: 500_000,
+          totalDeltaCents: 150_000,
+          categoryChanges: [monthlyChange],
+          biggestIncreases: [monthlyChange],
+          biggestDecreases: [],
+          unusualTransactions: [],
+          topMerchants: [],
+        },
+      });
+
+      const categoryInsights = result.insights.filter((insight) => insight.title === 'Mat');
+      expect(categoryInsights).toHaveLength(1);
+      expect(categoryInsights[0]).toMatchObject({
+        source: 'budget',
+        supportingDetail: '1 500,00 kr högre än normal nivå',
+      });
+    });
+
+    it('uses documented unclassified severity thresholds', () => {
+      const summaryWithCount = (count: number) => buildFinancialHealthSummary({
+        ...baseInput(),
+        financialSummary: {
+          ...calculateFinancialSummary([]),
+          unclassifiedCount: count,
+        },
+      });
+
+      expect(summaryWithCount(0).insights).toEqual([]);
+      expect(summaryWithCount(1).insights[0].severity).toBe('info');
+      expect(summaryWithCount(2).insights[0].severity).toBe('info');
+      expect(summaryWithCount(3).insights[0].severity).toBe('attention');
+      expect(summaryWithCount(10).insights[0].severity).toBe('important');
+    });
+
+    it('creates positive and attention signals from saving goals', () => {
+      const positive = buildFinancialHealthSummary({
+        ...baseInput(),
+        savingBudgetRows: [budgetRow('Sparande', 200_000, 380_000)],
+      });
+      const attention = buildFinancialHealthSummary({
+        ...baseInput(),
+        savingBudgetRows: [budgetRow('Sparande', 300_000, 180_000)],
+      });
+
+      expect(positive.insights[0]).toMatchObject({
+        severity: 'positive',
+        title: 'Sparmål',
+        amountCents: 180_000,
+        source: 'savings',
+      });
+      expect(attention.insights[0]).toMatchObject({
+        severity: 'attention',
+        title: 'Sparmål',
+        amountCents: 120_000,
+        source: 'savings',
+      });
+    });
+
+    it('excludes full-month changes in the current month while retaining current-safe signals', () => {
+      const result = buildFinancialHealthSummary({
+        ...baseInput(),
+        isCurrentMonth: true,
+        financialSummary: {
+          ...calculateFinancialSummary([]),
+          unclassifiedCount: 3,
+        },
+        savingBudgetRows: [budgetRow('Sparande', 300_000, 180_000)],
+        monthlyInsights: {
+          status: 'incomplete-month',
+          baselineKind: null,
+          baselineLabel: null,
+          baselineMonthCount: 0,
+          currentTotalCents: 100_000,
+          baselineTotalCents: 0,
+          totalDeltaCents: 0,
+          categoryChanges: [],
+          biggestIncreases: [],
+          biggestDecreases: [],
+          unusualTransactions: [],
+          topMerchants: [],
+        },
+      });
+
+      expect(result.insights.some((insight) => insight.source === 'monthly-change')).toBe(false);
+      expect(result.insights.map((insight) => insight.type)).toEqual(expect.arrayContaining([
+        'goal-under',
+        'unclassified',
+      ]));
+    });
+
+    it('limits output deterministically without positives displacing attention', () => {
+      const monthlyChanges = Array.from({ length: 8 }, (_, index) => ({
+        category: `Kategori ${index}`,
+        currentCents: 200_000 + index * 10_000,
+        baselineCents: 100_000,
+        deltaCents: 100_000 + index * 10_000,
+        deltaPercent: 100 + index * 10,
+      }));
+      const input = {
+        ...baseInput(),
+        consumptionBudgetRows: [
+          budgetRow('Positiv 1', 500_000, 300_000),
+          budgetRow('Positiv 2', 500_000, 300_000),
+          budgetRow('Positiv 3', 500_000, 300_000),
+        ],
+        monthlyInsights: {
+          status: 'available' as const,
+          baselineKind: 'historical-average' as const,
+          baselineLabel: 'Jämfört med snitt',
+          baselineMonthCount: 3,
+          currentTotalCents: 2_000_000,
+          baselineTotalCents: 1_000_000,
+          totalDeltaCents: 1_000_000,
+          categoryChanges: monthlyChanges,
+          biggestIncreases: monthlyChanges,
+          biggestDecreases: [],
+          unusualTransactions: [],
+          topMerchants: [],
+        },
+      };
+
+      const first = buildFinancialHealthSummary(input);
+      const second = buildFinancialHealthSummary(input);
+      expect(first.insights).toHaveLength(6);
+      expect(first.insights.slice(0, 4).every((insight) =>
+        insight.severity === 'important' || insight.severity === 'attention'
+      )).toBe(true);
+      expect(first.insights).toEqual(second.insights);
+      expect(first.status).toBe(second.status);
+    });
   });
 
   it('detects a clear sustained monthly increase from period medians', () => {

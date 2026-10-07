@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { amountForCategoryFlow, buildBudgetAnalysis, buildMonthlyInsights, buildRecurringCostTrendInsights, buildRecurringExpenseInsights, calculateFinancialSummary, createTransactionClassifier, findExactMerchantTransactionIds, findLearnedTransactionType, findPotentialDuplicateIds, formatCurrencyFromCents, ikeaBarkarbyRules, internalTransferRule, isIncludedInOverview, needsCategoryDecision, normalizedMerchantKey, sortCategoriesByUsage, sumCategoryFlow, transactionsForCategoryFlow, transactionTypes, type BudgetRow, type RecurringExpenseInsight, type TransactionType } from './lib/finance';
+import { amountForCategoryFlow, buildBudgetAnalysis, buildFinancialHealthSummary, buildMonthlyInsights, buildRecurringCostTrendInsights, buildRecurringExpenseInsights, calculateFinancialSummary, createTransactionClassifier, findExactMerchantTransactionIds, findLearnedTransactionType, findPotentialDuplicateIds, formatCurrencyFromCents, ikeaBarkarbyRules, internalTransferRule, isIncludedInOverview, needsCategoryDecision, normalizedMerchantKey, sortCategoriesByUsage, sumCategoryFlow, transactionsForCategoryFlow, transactionTypes, type BudgetRow, type RecurringExpenseInsight, type TransactionType } from './lib/finance';
 import { parseMoneyToCents, parseWorkbookSheets, sha256Hex, unwrapExcelCellValue, type ImportIssue, type ImportResult, type ImportedBankTransaction } from './lib/bankImport';
 
 type Tab = 'overview' | 'import' | 'review';
@@ -424,7 +424,6 @@ export default function App() {
     ),
     [transactions, recurringReference, today]
   );
-
   const yearTransactions = useMemo(
     () => transactions.filter((row) =>
       validDate(row.date) && row.date.startsWith(`${selectedYear}-`)
@@ -466,6 +465,35 @@ export default function App() {
     today,
     defaultCategories: ['Sparande / Amortering'],
   }), [reportTransactions, yearTransactions, budgets, selectedYear, today]);
+  const financialHealth = useMemo(
+    () => selectedMonth === 'all'
+      ? null
+      : buildFinancialHealthSummary({
+          financialSummary: summary.current,
+          consumptionBudgetRows: consumptionBudget.rows,
+          savingBudgetRows: savingBudget.rows,
+          amortizationBudgetRows: amortizationBudget.rows,
+          monthlyInsights,
+          recurringInsights,
+          costTrends: recurringCostTrends,
+          isCurrentMonth:
+            Number(selectedYear) === currentYear &&
+            Number(selectedMonth) === today.getMonth() + 1,
+        }),
+    [
+      selectedMonth,
+      selectedYear,
+      summary.current,
+      consumptionBudget.rows,
+      savingBudget.rows,
+      amortizationBudget.rows,
+      monthlyInsights,
+      recurringInsights,
+      recurringCostTrends,
+      currentYear,
+      today,
+    ]
+  );
   const categoryRows = consumptionBudget.rows;
   const incomeRows = incomeBudget.rows;
   const wealthGoalRows: Array<BudgetRow & { goalLabel: string }> = [
@@ -994,6 +1022,48 @@ export default function App() {
 
         {activeTab === 'overview' && !selectedCategory && (
           <>
+            <article className={`panel health-panel ${financialHealth?.status ?? 'year-view'}`}>
+              <div className="panel-header">
+                <div>
+                  <h3>Din ekonomi</h3>
+                  <span>{periodLabel}</span>
+                </div>
+              </div>
+              {financialHealth == null ? (
+                <p className="empty-state">Välj en månad för prioriterade ekonomiska insikter.</p>
+              ) : (
+                <>
+                  <div className="health-heading">
+                    <strong>{financialHealth.headline}</strong>
+                    <span>{financialHealth.supportingText}</span>
+                  </div>
+                  {financialHealth.insights.length > 0 && (
+                    <div className="health-grid">
+                      {financialHealth.insights.map((insight) => (
+                        <section className={`health-card ${insight.severity}`} key={insight.id}>
+                          <span className="health-severity">
+                            {insight.severity === 'important'
+                              ? 'Viktigt'
+                              : insight.severity === 'attention'
+                                ? 'Att se över'
+                                : insight.severity === 'positive'
+                                  ? 'Positivt'
+                                  : 'Information'}
+                          </span>
+                          <strong>{insight.title}</strong>
+                          <p>{insight.summary}</p>
+                          {insight.supportingDetail && <small>{insight.supportingDetail}</small>}
+                        </section>
+                      ))}
+                    </div>
+                  )}
+                  {financialHealth.hiddenCount > 0 && (
+                    <p className="health-more">+{financialHealth.hiddenCount} fler insikter finns i detaljsektionerna nedan.</p>
+                  )}
+                </>
+              )}
+            </article>
+
             <div className="stats-grid">
               <article className="stat-card expense"><span>Konsumtionsutgifter</span><strong>{formatMoney(summary.current.consumptionExpensesCents)}</strong><small>{formatMoney(summary.current.consumptionExpensesCents - summary.comparison.consumptionExpensesCents)} mot {comparisonLabel}</small></article>
               <article className="stat-card income"><span>Inkomster</span><strong>{formatMoney(summary.current.incomeCents)}</strong><small>{formatMoney(summary.current.incomeCents - summary.comparison.incomeCents)} mot {comparisonLabel}</small></article>

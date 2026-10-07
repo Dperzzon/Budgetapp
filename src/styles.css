@@ -203,6 +203,24 @@ tbody tr:last-child td { border-bottom: 0; }
 .trend-change { margin: 12px 0 5px; color: var(--red); font-size: .9rem; font-weight: 750; }
 .trend-copy { margin: 0 0 8px; color: var(--ink); font-size: .75rem; line-height: 1.4; }
 .trend-card small { color: var(--muted); font-size: .68rem; }
+.health-panel { margin-bottom: 14px; border-top: 3px solid #8da99a; }
+.health-panel.needs-review { border-top-color: #b76b5d; }
+.health-panel.attention { border-top-color: var(--amber); }
+.health-panel.good { border-top-color: var(--green); }
+.health-heading { display: flex; flex-direction: column; gap: 3px; margin-bottom: 14px; }
+.health-heading strong { font-size: 1.05rem; }
+.health-heading span { color: var(--muted); font-size: .78rem; }
+.health-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+.health-card { border: 1px solid var(--line); border-left-width: 3px; border-radius: 5px; padding: 10px 11px; background: #fcfdfc; }
+.health-card.important { border-left-color: #b76b5d; background: #fffaf8; }
+.health-card.attention { border-left-color: var(--amber); background: #fffcf6; }
+.health-card.positive { border-left-color: var(--green); background: #f8fcf9; }
+.health-card.info { border-left-color: #8da99a; }
+.health-severity { display: block; margin-bottom: 4px; color: var(--muted); font-size: .63rem; font-weight: 750; text-transform: uppercase; letter-spacing: .04em; }
+.health-card > strong { display: block; overflow: hidden; font-size: .83rem; text-overflow: ellipsis; white-space: nowrap; }
+.health-card p { margin: 4px 0 0; color: var(--ink); font-size: .76rem; line-height: 1.35; }
+.health-card small { display: block; margin-top: 4px; color: var(--muted); font-size: .68rem; line-height: 1.35; }
+.health-more { margin: 11px 0 0; color: var(--muted); font-size: .72rem; }
 
 @media (max-width: 1120px) {
   .app-shell { grid-template-columns: 215px minmax(0, 1fr); }
@@ -211,6 +229,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .insights-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .recurring-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .trend-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stat-card strong { font-size: 1.35rem; }
 }
 
@@ -241,6 +260,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .insights-grid { grid-template-columns: 1fr; }
   .recurring-grid { grid-template-columns: 1fr; }
   .trend-grid { grid-template-columns: 1fr; }
+  .health-grid { grid-template-columns: 1fr; }
   .panel { padding: 14px 12px; }
   .monthly-chart { gap: 3px; }
   .month-column small { font-size: .59rem; }
