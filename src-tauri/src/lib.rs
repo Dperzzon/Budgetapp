@@ -755,7 +755,8 @@ fn open_app_connection(app: &tauri::AppHandle) -> Result<Connection, String> {
 #[tauri::command]
 fn init_db(app: tauri::AppHandle) -> Result<String, String> {
     let db_path = app_db_path(&app)?;
-    initialize_database(&db_path)?;
+    initialize_database(&db_path)
+        .map_err(|error| format!("{error}\nDatabasfil: {}", db_path.display()))?;
     Ok(db_path.display().to_string())
 }
 
@@ -1380,6 +1381,35 @@ fn remember_transaction_type_choice(
     tx.commit().map_err(|error| error.to_string())
 }
 
+fn remember_category_choice(
+    conn: &mut Connection,
+    id: i64,
+    merchant_key: &str,
+    category: &str,
+) -> Result<(), String> {
+    if merchant_key.trim().is_empty() {
+        return Err("Merchant-nyckel får inte vara tom.".to_string());
+    }
+    if category.trim().is_empty() {
+        return Err("Kategori får inte vara tom.".to_string());
+    }
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    update_single_category(&tx, id, category)?;
+    upsert_learned_rule(&tx, merchant_key, category)?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn remember_category(
+    app: tauri::AppHandle,
+    id: i64,
+    merchant_key: String,
+    category: String,
+) -> Result<(), String> {
+    let mut conn = open_app_connection(&app)?;
+    remember_category_choice(&mut conn, id, &merchant_key, &category)
+}
+
 #[tauri::command]
 fn remember_transaction_type(
     app: tauri::AppHandle,
@@ -1434,6 +1464,7 @@ pub fn run() {
             bulk_update_transaction_categories,
             save_learned_rule,
             save_learned_transaction_type_rule,
+            remember_category,
             remember_transaction_type,
             reject_transaction_category,
             delete_transaction
@@ -2298,6 +2329,48 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM learned_transaction_type_rules
                  WHERE merchant_key = 'SHOULD NOT EXIST'",
+                (),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_rule_count, 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn remembering_a_category_updates_only_the_selected_row_and_future_rule_atomically() {
+        let path = temporary_database("remember-category");
+        let mut conn = initialize_database(&path).unwrap();
+        let selected = insert_transaction(&conn, "ICA MAXI", "Okategoriserat");
+        let historical_match = insert_transaction(&conn, "ICA MAXI", "Okategoriserat");
+
+        remember_category_choice(&mut conn, selected, "ICA MAXI", "Mat / Dagligvaror").unwrap();
+
+        let categories: Vec<String> = conn
+            .prepare("SELECT category FROM transactions ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let rule: String = conn
+            .query_row(
+                "SELECT category FROM learned_rules WHERE merchant_key = 'ICA MAXI'",
+                (),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(categories, vec!["Mat / Dagligvaror", "Okategoriserat"]);
+        assert_eq!(rule, "Mat / Dagligvaror");
+        assert_ne!(selected, historical_match);
+
+        assert!(
+            remember_category_choice(&mut conn, i64::MAX, "SHOULD NOT EXIST", "Övrigt").is_err()
+        );
+        let failed_rule_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM learned_rules WHERE merchant_key = 'SHOULD NOT EXIST'",
                 (),
                 |row| row.get(0),
             )

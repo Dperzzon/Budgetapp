@@ -17,6 +17,7 @@ import {
   findPotentialDuplicateIds,
   findSameMerchantTransactionIds,
   formatCurrencyFromCents,
+  getPeriodStatus,
   hasBankTransactionHeaders,
   getCoveredMonths,
   inferTransactionType,
@@ -75,6 +76,17 @@ describe('budget correctness', () => {
     kind,
     year,
     today,
+  });
+
+  describe('period status', () => {
+    const now = new Date(2026, 9, 7);
+
+    it('classifies previous, current, future, and future-year months centrally', () => {
+      expect(getPeriodStatus(2026, 9, now)).toBe('past');
+      expect(getPeriodStatus(2026, 10, now)).toBe('current');
+      expect(getPeriodStatus(2026, 11, now)).toBe('future');
+      expect(getPeriodStatus(2027, 1, now)).toBe('future');
+    });
   });
 
   it('counts only completed months with relevant consumption data', () => {
@@ -568,6 +580,31 @@ describe('classification and summary', () => {
           expect(result.status).toBe('incomplete-month');
           expect(result.categoryChanges).toEqual([]);
           expect(result.totalDeltaCents).toBe(0);
+        });
+
+        it('does not calculate changes for a future month or future year', () => {
+          const transactions = [
+            insightTransaction(1, '2026-08-10', 'Mat', -40_000),
+            insightTransaction(2, '2026-09-10', 'Mat', -50_000),
+            insightTransaction(3, '2026-11-10', 'Mat', -60_000),
+            insightTransaction(4, '2027-01-10', 'Mat', -70_000),
+          ];
+
+          const futureMonth = buildMonthlyInsights(transactions, 2026, 11, today);
+          const futureYear = buildMonthlyInsights(transactions, 2027, 1, today);
+
+          expect(futureMonth).toMatchObject({
+            status: 'future-period',
+            categoryChanges: [],
+            unusualTransactions: [],
+            topMerchants: [],
+          });
+          expect(futureYear).toMatchObject({
+            status: 'future-period',
+            categoryChanges: [],
+            unusualTransactions: [],
+            topMerchants: [],
+          });
         });
 
         it('filters noise using both absolute and percentage thresholds', () => {
@@ -1248,7 +1285,7 @@ describe('recurring cost trend insights', () => {
         increasing: [],
         decreasing: [],
       },
-      isCurrentMonth: false,
+      periodStatus: 'past' as const,
     });
 
     it('returns a transparent good status when there are no relevant signals', () => {
@@ -1257,6 +1294,24 @@ describe('recurring cost trend insights', () => {
       expect(result).toMatchObject({
         status: 'good',
         headline: 'Ekonomin ser stabil ut',
+        insights: [],
+        importantCount: 0,
+        attentionCount: 0,
+        positiveCount: 0,
+      });
+    });
+
+    it('returns no outcome assessment for a future period', () => {
+      const result = buildFinancialHealthSummary({
+        ...baseInput(),
+        periodStatus: 'future',
+        consumptionBudgetRows: [budgetRow('Mat', 500_000, 0)],
+        savingBudgetRows: [budgetRow('Sparande', 100_000, 0)],
+      });
+
+      expect(result).toMatchObject({
+        status: 'future',
+        headline: 'Den här perioden har inte börjat ännu',
         insights: [],
         importantCount: 0,
         attentionCount: 0,
@@ -1505,7 +1560,7 @@ describe('recurring cost trend insights', () => {
     it('excludes full-month changes in the current month while retaining current-safe signals', () => {
       const result = buildFinancialHealthSummary({
         ...baseInput(),
-        isCurrentMonth: true,
+        periodStatus: 'current',
         financialSummary: {
           ...calculateFinancialSummary([]),
           unclassifiedCount: 3,

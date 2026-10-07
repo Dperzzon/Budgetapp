@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { amountForCategoryFlow, buildBudgetAnalysis, buildFinancialHealthSummary, buildMonthlyInsights, buildRecurringCostTrendInsights, buildRecurringExpenseInsights, calculateFinancialSummary, createTransactionClassifier, findExactMerchantTransactionIds, findLearnedTransactionType, findPotentialDuplicateIds, formatCurrencyFromCents, ikeaBarkarbyRules, internalTransferRule, isIncludedInOverview, needsCategoryDecision, normalizedMerchantKey, sortCategoriesByUsage, sumCategoryFlow, transactionsForCategoryFlow, transactionTypes, type BudgetRow, type RecurringExpenseInsight, type TransactionType } from './lib/finance';
+import { amountForCategoryFlow, buildBudgetAnalysis, buildFinancialHealthSummary, buildMonthlyInsights, buildRecurringCostTrendInsights, buildRecurringExpenseInsights, calculateFinancialSummary, createTransactionClassifier, findExactMerchantTransactionIds, findLearnedTransactionType, findPotentialDuplicateIds, formatCurrencyFromCents, getPeriodStatus, ikeaBarkarbyRules, internalTransferRule, isIncludedInOverview, needsCategoryDecision, normalizedMerchantKey, sortCategoriesByUsage, sumCategoryFlow, transactionsForCategoryFlow, transactionTypes, type BudgetRow, type RecurringExpenseInsight, type TransactionType } from './lib/finance';
 import { parseMoneyToCents, parseWorkbookSheets, sha256Hex, unwrapExcelCellValue, type ImportIssue, type ImportResult, type ImportedBankTransaction } from './lib/bankImport';
+import { buildBulkConfirmation, buildRememberForwardConfirmation, createLatestRunGuard, getUserFacingError, importAnalysisPhaseText, importControlsDisabled, runConfirmedAction, runDatabaseInitialization, runSequentialFileImports, type ErrorContext, type FileImportOutcome } from './lib/releaseSafety';
+import { deepAnalysisInitiallyOpen, firstRunCopy, getDashboardMode, getDashboardSections, shiftMonth } from './lib/dashboardPresentation';
 
 type Tab = 'overview' | 'import' | 'review';
 type ReviewFilter = 'all' | 'pending' | 'checked';
@@ -260,8 +262,15 @@ export default function App() {
   const [budgetDrafts, setBudgetDrafts] = useState<Record<string, string>>({});
   const [budgetedMonthCount, setBudgetedMonthCount] = useState(0);
   const [errorMessage, setErrorMessage] = useState('');
+  const [errorTechnicalDetails, setErrorTechnicalDetails] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
   const [isImporting, setIsImporting] = useState(false);
+  const [isAnalyzingImport, setIsAnalyzingImport] = useState(false);
+  const [importAnalysisStatus, setImportAnalysisStatus] = useState('');
+  const [importOutcomes, setImportOutcomes] = useState<FileImportOutcome[]>([]);
+  const [fatalDatabaseError, setFatalDatabaseError] = useState<ReturnType<typeof getUserFacingError> | null>(null);
+  const [deepAnalysisOpen, setDeepAnalysisOpen] = useState(deepAnalysisInitiallyOpen);
+  const importAnalysisGuard = useRef(createLatestRunGuard());
 
   const classifyImportedTransaction = useMemo(() => {
     const classifyCategory = createTransactionClassifier([
@@ -292,26 +301,50 @@ export default function App() {
     return batches;
   };
 
+  const clearError = () => {
+    setErrorMessage('');
+    setErrorTechnicalDetails('');
+  };
+
+  const showUserFacingError = (error: unknown, context: ErrorContext, fileName?: string) => {
+    const userError = getUserFacingError(error, context, fileName);
+    setErrorMessage(userError.message);
+    setErrorTechnicalDetails(userError.technicalDetails);
+  };
+
+  const initializeDatabase = async () => {
+    setDbReady(false);
+    setFatalDatabaseError(null);
+    setDbStatus('Ansluter till lokal databas');
+    const result = await runDatabaseInitialization(async () => {
+      const path = await invoke<string>('init_db');
+      setDbStatus(path);
+      const stored = await refreshTransactions();
+      const savedRules = await invoke<LearnedMerchantRule[]>('get_learned_rules');
+      const savedTypeRules = await invoke<LearnedTransactionTypeRule[]>('get_learned_transaction_type_rules');
+      await refreshImportBatches();
+      return { path, stored, savedRules, savedTypeRules };
+    });
+    if (result.status === 'fatal') {
+      setDbStatus(result.error.dataLocation || 'Databasen kunde inte öppnas');
+      setFatalDatabaseError(result.error);
+      return;
+    }
+    setLearnedRules(result.value.savedRules);
+    setLearnedTransactionTypeRules(result.value.savedTypeRules);
+    const years = result.value.stored
+      .filter((row) => validDate(row.date))
+      .map((row) => Number(row.date.slice(0, 4)));
+    const latestYear = years.length ? Math.max(...years) : currentYear;
+    setSelectedYear(String(latestYear));
+    setComparisonYear(String(latestYear - 1));
+    setDbStatus(result.value.path);
+    clearError();
+    setDbReady(true);
+  };
+
   useEffect(() => {
-    void (async () => {
-      try {
-        const path = await invoke<string>('init_db');
-        const stored = await refreshTransactions();
-        const savedRules = await invoke<LearnedMerchantRule[]>('get_learned_rules');
-        const savedTypeRules = await invoke<LearnedTransactionTypeRule[]>('get_learned_transaction_type_rules');
-        await refreshImportBatches();
-        setLearnedRules(savedRules);
-        setLearnedTransactionTypeRules(savedTypeRules);
-        const years = stored.filter((row) => validDate(row.date)).map((row) => Number(row.date.slice(0, 4)));
-        const latestYear = years.length ? Math.max(...years) : currentYear;
-        setSelectedYear(String(latestYear));
-        setComparisonYear(String(latestYear - 1));
-        setDbStatus(path);
-        setDbReady(true);
-      } catch (error) {
-        setDbStatus(`Databasfel: ${String(error)}`);
-      }
-    })();
+    void initializeDatabase();
   }, [currentYear]);
 
   useEffect(() => {
@@ -331,7 +364,7 @@ export default function App() {
       setBudgetDrafts(Object.fromEntries(
         Object.entries(values).map(([category, amountCents]) => [category, centsToInputValue(amountCents)])
       ));
-    }).catch((error) => setErrorMessage(`Kunde inte läsa budgetar: ${String(error)}`));
+    }).catch((error) => showUserFacingError(error, 'budget-load'));
     return () => { active = false; };
   }, [dbReady, selectedYear, selectedMonth]);
 
@@ -396,6 +429,12 @@ export default function App() {
       : buildMonthlyInsights(transactions, Number(selectedYear), Number(selectedMonth), today),
     [transactions, selectedYear, selectedMonth, today]
   );
+  const periodStatus = useMemo(
+    () => selectedMonth === 'all'
+      ? null
+      : getPeriodStatus(Number(selectedYear), Number(selectedMonth), today),
+    [selectedYear, selectedMonth, today]
+  );
   const recurringReference = useMemo(() => {
     const selectedYearNumber = Number(selectedYear);
     const referenceYear = selectedMonth === 'all'
@@ -407,22 +446,26 @@ export default function App() {
     return { year: referenceYear, month: referenceMonth };
   }, [selectedYear, selectedMonth, currentYear, today]);
   const recurringInsights = useMemo(
-    () => buildRecurringExpenseInsights(
-      transactions,
-      recurringReference.year,
-      recurringReference.month,
-      today
-    ),
-    [transactions, recurringReference, today]
+    () => periodStatus === 'future'
+      ? null
+      : buildRecurringExpenseInsights(
+          transactions,
+          recurringReference.year,
+          recurringReference.month,
+          today
+        ),
+    [transactions, recurringReference, periodStatus, today]
   );
   const recurringCostTrends = useMemo(
-    () => buildRecurringCostTrendInsights(
-      transactions,
-      recurringReference.year,
-      recurringReference.month,
-      today
-    ),
-    [transactions, recurringReference, today]
+    () => periodStatus === 'future'
+      ? null
+      : buildRecurringCostTrendInsights(
+          transactions,
+          recurringReference.year,
+          recurringReference.month,
+          today
+        ),
+    [transactions, recurringReference, periodStatus, today]
   );
   const yearTransactions = useMemo(
     () => transactions.filter((row) =>
@@ -466,7 +509,7 @@ export default function App() {
     defaultCategories: ['Sparande / Amortering'],
   }), [reportTransactions, yearTransactions, budgets, selectedYear, today]);
   const financialHealth = useMemo(
-    () => selectedMonth === 'all'
+    () => selectedMonth === 'all' || recurringInsights == null || recurringCostTrends == null || periodStatus == null
       ? null
       : buildFinancialHealthSummary({
           financialSummary: summary.current,
@@ -476,9 +519,7 @@ export default function App() {
           monthlyInsights,
           recurringInsights,
           costTrends: recurringCostTrends,
-          isCurrentMonth:
-            Number(selectedYear) === currentYear &&
-            Number(selectedMonth) === today.getMonth() + 1,
+          periodStatus,
         }),
     [
       selectedMonth,
@@ -490,8 +531,7 @@ export default function App() {
       monthlyInsights,
       recurringInsights,
       recurringCostTrends,
-      currentYear,
-      today,
+      periodStatus,
     ]
   );
   const categoryRows = consumptionBudget.rows;
@@ -537,16 +577,22 @@ export default function App() {
     const files = [...(event.target.files ?? [])];
     event.currentTarget.value = '';
     if (!files.length) return;
+    if (isAnalyzingImport || isImporting) return;
     if (!dbReady) {
       setErrorMessage('Vänta tills den lokala databasen och tidigare kategorival har laddats.');
+      setErrorTechnicalDetails('');
       return;
     }
     const invalid = files.filter((file) => !file.name.toLowerCase().endsWith('.xlsx'));
     if (invalid.length) {
       setErrorMessage('Endast .xlsx-filer stöds.');
+      setErrorTechnicalDetails('');
       return;
     }
 
+    const runId = importAnalysisGuard.current.begin();
+    setIsAnalyzingImport(true);
+    setImportOutcomes([]);
     try {
       setPreviewRows([]);
       setPreviewFiles([]);
@@ -554,12 +600,16 @@ export default function App() {
       setImportBlockingErrors([]);
       setPendingImports([]);
       setExistingImportMatches([]);
-      setErrorMessage('');
-      setStatusMessage('Kontrollerar och läser bankfiler...');
-      const hashedFiles = await Promise.all(files.map(async (file) => {
+      clearError();
+      const hashedFiles: Array<{ file: File; bytes: ArrayBuffer; fileSha256: string }> = [];
+      for (const [index, file] of files.entries()) {
+        setImportAnalysisStatus(importAnalysisPhaseText('preparing', index + 1, files.length));
         const bytes = await file.arrayBuffer();
-        return { file, bytes, fileSha256: await sha256Hex(bytes) };
-      }));
+        if (!importAnalysisGuard.current.isLatest(runId)) return;
+        const fileSha256 = await sha256Hex(bytes);
+        if (!importAnalysisGuard.current.isLatest(runId)) return;
+        hashedFiles.push({ file, bytes, fileSha256 });
+      }
       const seenHashes = new Set<string>();
       const repeatedSelectionIssues: ImportIssue[] = [];
       const uniqueFiles = hashedFiles.filter(({ file, fileSha256 }) => {
@@ -577,12 +627,31 @@ export default function App() {
         });
         return false;
       });
-      const checkedFiles = await Promise.all(uniqueFiles.map(async ({ file, bytes, fileSha256 }) => {
+      const checkedFiles: Array<{
+        file: File;
+        fileSha256: string;
+        existing: ImportBatchSummary | null;
+        result: ImportResult | null;
+      }> = [];
+      for (const [index, { file, bytes, fileSha256 }] of uniqueFiles.entries()) {
+        setImportAnalysisStatus(importAnalysisPhaseText(
+          'checking-duplicate',
+          index + 1,
+          uniqueFiles.length
+        ));
         const existing = await invoke<ImportBatchSummary | null>('find_import_batch_by_hash', { fileSha256 });
-        if (existing) return { file, fileSha256, existing, result: null };
+        if (!importAnalysisGuard.current.isLatest(runId)) return;
+        if (existing) {
+          checkedFiles.push({ file, fileSha256, existing, result: null });
+          continue;
+        }
+        setImportAnalysisStatus(importAnalysisPhaseText('reading-workbook', index + 1, uniqueFiles.length));
         const result = await parseWorkbookRows(file, bytes, classifyImportedTransaction);
-        return { file, fileSha256, existing: null, result };
-      }));
+        if (!importAnalysisGuard.current.isLatest(runId)) return;
+        setImportAnalysisStatus(importAnalysisPhaseText('validating', index + 1, uniqueFiles.length));
+        checkedFiles.push({ file, fileSha256, existing: null, result });
+      }
+      if (!importAnalysisGuard.current.isLatest(runId)) return;
       const readyImports: PendingImport[] = checkedFiles
         .filter((item): item is typeof item & { result: ImportResult } => item.result !== null)
         .map(({ file, fileSha256, result }) => ({ fileName: file.name, fileSha256, result }));
@@ -617,6 +686,7 @@ export default function App() {
             : `${rows.length} godkända rader hittades i ${readyImports.length} fil(er). Kontrollera urvalet innan import.`
       );
     } catch (error) {
+      if (!importAnalysisGuard.current.isLatest(runId)) return;
       setStatusMessage('');
       setPreviewRows([]);
       setPreviewFiles([]);
@@ -624,53 +694,80 @@ export default function App() {
       setImportBlockingErrors([]);
       setPendingImports([]);
       setExistingImportMatches([]);
-      setErrorMessage(error instanceof Error ? error.message : 'Kunde inte läsa bankfilen.');
+      showUserFacingError(error, 'import-analysis');
+    } finally {
+      if (importAnalysisGuard.current.isLatest(runId)) {
+        setIsAnalyzingImport(false);
+        setImportAnalysisStatus('');
+      }
     }
   };
 
   const handleImport = async () => {
-    if (!previewRows.length || !pendingImports.length || importBlockingErrors.length) return;
+    if (
+      isAnalyzingImport ||
+      !previewRows.length ||
+      !pendingImports.length ||
+      importBlockingErrors.length
+    ) return;
     setIsImporting(true);
-    setErrorMessage('');
+    clearError();
+    setImportOutcomes([]);
+    const outcomes: FileImportOutcome[] = [];
     try {
-      let insertedCount = 0;
-      for (const pendingImport of pendingImports) {
-        const imported = await invoke<ImportBatchSummary>('import_transactions', {
-          fileName: pendingImport.fileName,
-          fileSha256: pendingImport.fileSha256,
-          transactions: pendingImport.result.acceptedRows.map((row) => ({
-            merchant: row.merchant,
-            amount_cents: row.amountCents,
-            category: row.category,
-            transaction_type: row.transactionType,
-            date: row.date,
-            source_file: row.sourceFile,
-            needs_review: row.needsReview,
-            imported_sheet: row.importedSheet,
-            imported_row: row.importedRow,
-          })),
-        });
-        insertedCount += imported.transactionCount;
-      }
+      const importResult = await runSequentialFileImports(pendingImports, async (pendingImport) => {
+        return invoke<ImportBatchSummary>('import_transactions', {
+            fileName: pendingImport.fileName,
+            fileSha256: pendingImport.fileSha256,
+            transactions: pendingImport.result.acceptedRows.map((row) => ({
+              merchant: row.merchant,
+              amount_cents: row.amountCents,
+              category: row.category,
+              transaction_type: row.transactionType,
+              date: row.date,
+              source_file: row.sourceFile,
+              needs_review: row.needsReview,
+              imported_sheet: row.importedSheet,
+              imported_row: row.importedRow,
+            })),
+          });
+      });
+      outcomes.push(...importResult.outcomes);
+      const insertedCount = outcomes.reduce(
+        (total, outcome) => total + (outcome.status === 'imported' ? outcome.transactionCount : 0),
+        0
+      );
+      const firstFailedIndex = importResult.firstFailedIndex;
       const stored = await refreshTransactions();
       await refreshImportBatches();
-      setStatusMessage(`${insertedCount} transaktioner importerades. Möjliga dubletter är markerade för manuell kontroll.`);
-      setPreviewRows([]);
-      setPreviewFiles([]);
-      setImportWarnings([]);
-      setImportBlockingErrors([]);
-      setPendingImports([]);
-      setExistingImportMatches([]);
-      setActiveTab('overview');
+      setImportOutcomes(outcomes);
+      if (firstFailedIndex < 0) {
+        setStatusMessage(`${insertedCount} transaktioner importerades. Möjliga dubletter är markerade för manuell kontroll.`);
+        setPreviewRows([]);
+        setPreviewFiles([]);
+        setImportWarnings([]);
+        setImportBlockingErrors([]);
+        setPendingImports([]);
+        setExistingImportMatches([]);
+      } else {
+        const remaining = pendingImports.slice(firstFailedIndex);
+        setPendingImports(remaining);
+        setPreviewFiles(remaining.map((item) => item.fileName));
+        setPreviewRows(remaining.flatMap((item) => item.result.acceptedRows));
+        setStatusMessage(
+          `${outcomes.filter((outcome) => outcome.status === 'imported').length} fil(er) importerades och finns kvar. ` +
+          `${outcomes.filter((outcome) => outcome.status === 'failed').length} fil misslyckades. ` +
+          'Den misslyckade filen sparades inte och kan rättas och importeras igen.'
+        );
+      }
       const importedYears = stored.filter((row) => validDate(row.date)).map((row) => Number(row.date.slice(0, 4)));
       if (importedYears.length) {
         setSelectedYear(String(Math.max(...importedYears)));
         setComparisonYear(String(Math.max(...importedYears) - 1));
       }
     } catch (error) {
-      await refreshTransactions();
-      await refreshImportBatches();
-      setErrorMessage(`Importen misslyckades: ${String(error)}`);
+      setImportOutcomes(outcomes);
+      showUserFacingError(error, 'import-history');
     } finally {
       setIsImporting(false);
     }
@@ -696,9 +793,9 @@ export default function App() {
         year: Number(selectedYear),
       }));
       setStatusMessage(`Budget för ${category} sparad.`);
-      setErrorMessage('');
+      clearError();
     } catch (error) {
-      setErrorMessage(`Kunde inte spara budget: ${String(error)}`);
+      showUserFacingError(error, 'budget-save');
     }
   };
 
@@ -721,63 +818,81 @@ export default function App() {
         : item));
       clearCategoryDrafts([String(row.id)]);
       setStatusMessage(`${category} valdes endast för ${row.merchant}.`);
-      setErrorMessage('');
+      clearError();
     } catch (error) {
-      setErrorMessage(`Kunde inte uppdatera kategorin: ${String(error)}`);
+      showUserFacingError(error, 'review-update');
     }
   };
 
   const updateExactMerchantCategories = async (row: Transaction, category: string) => {
     const transactionIds = findExactMerchantTransactionIds(transactions, row.merchant);
     if (!transactionIds.length) return;
-    try {
-      const updatedCount = await invoke<number>('bulk_update_transaction_categories', {
-        ids: transactionIds.map(Number),
-        category,
-      });
-      await refreshImportBatches();
-      const matchingIdSet = new Set(transactionIds);
-      setTransactions((current) => current.map((item) => matchingIdSet.has(String(item.id))
-        ? { ...item, category, needsReview: false, categoryDecided: true }
-        : item));
-      clearCategoryDrafts(transactionIds);
-      setStatusMessage(`${category} valdes för ${updatedCount} transaktioner med exakt merchant-nyckel ${normalizedMerchantKey(row.merchant)}.`);
-      setErrorMessage('');
-    } catch (error) {
-      setErrorMessage(`Kunde inte uppdatera liknande transaktioner: ${String(error)}`);
-    }
+    await runConfirmedAction(
+      window.confirm,
+      buildBulkConfirmation({
+        kind: 'category',
+        merchant: row.merchant,
+        count: transactionIds.length,
+        newValue: category,
+      }),
+      async () => {
+        try {
+          const updatedCount = await invoke<number>('bulk_update_transaction_categories', {
+            ids: transactionIds.map(Number),
+            category,
+          });
+          await refreshImportBatches();
+          const matchingIdSet = new Set(transactionIds);
+          setTransactions((current) => current.map((item) => matchingIdSet.has(String(item.id))
+            ? { ...item, category, needsReview: false, categoryDecided: true }
+            : item));
+          clearCategoryDrafts(transactionIds);
+          setStatusMessage(`${category} valdes för ${updatedCount} befintliga transaktioner med samma butik/mottagare.`);
+          clearError();
+        } catch (error) {
+          showUserFacingError(error, 'review-update');
+        }
+      }
+    );
   };
 
   const rememberCategoryForFuture = async (row: Transaction, category: string) => {
     const merchantKey = normalizedMerchantKey(row.merchant);
     if (!merchantKey || merchantKey === 'OKÄND MERCHANT') {
-      setErrorMessage('Det går inte att skapa en regel för en okänd merchant.');
+      setErrorMessage('Det går inte att komma ihåg ett val för en okänd butik eller mottagare.');
+      setErrorTechnicalDetails('');
       return;
     }
-    try {
-      await invoke('update_transaction_category', { id: Number(row.id), category });
-      await refreshImportBatches();
-      setTransactions((current) => current.map((item) => item.id === row.id
-        ? { ...item, category, needsReview: false, categoryDecided: true }
-        : item));
-      clearCategoryDrafts([String(row.id)]);
-    } catch (error) {
-      setErrorMessage(`Kunde inte uppdatera kategorin: ${String(error)}`);
-      return;
-    }
-
-    try {
-      await invoke('save_learned_rule', { merchantKey, category });
-      setLearnedRules((current) => [
-        ...current.filter((rule) => normalizedMerchantKey(rule.merchantKey) !== merchantKey),
-        { merchantKey, category },
-      ]);
-      setStatusMessage(`${category} valdes för denna transaktion och sparades för framtida importer från ${merchantKey}.`);
-      setErrorMessage('');
-    } catch (error) {
-      setStatusMessage(`${category} sparades för transaktionen, men ingen framtida regel skapades.`);
-      setErrorMessage(`Kunde inte spara merchant-regeln: ${String(error)}`);
-    }
+    await runConfirmedAction(
+      window.confirm,
+      buildRememberForwardConfirmation({
+        kind: 'category',
+        merchant: row.merchant,
+        newValue: category,
+      }),
+      async () => {
+        try {
+          await invoke('remember_category', {
+            id: Number(row.id),
+            merchantKey,
+            category,
+          });
+          await refreshImportBatches();
+          setTransactions((current) => current.map((item) => item.id === row.id
+            ? { ...item, category, needsReview: false, categoryDecided: true }
+            : item));
+          clearCategoryDrafts([String(row.id)]);
+          setLearnedRules((current) => [
+            ...current.filter((rule) => normalizedMerchantKey(rule.merchantKey) !== merchantKey),
+            { merchantKey, category },
+          ]);
+          setStatusMessage(`${category} valdes för denna transaktion och används även för framtida importer från samma butik/mottagare.`);
+          clearError();
+        } catch (error) {
+          showUserFacingError(error, 'review-update');
+        }
+      }
+    );
   };
 
   const selectCategory = (row: Transaction, category: string) => {
@@ -800,59 +915,80 @@ export default function App() {
       });
       await refreshImportBatches();
       setStatusMessage(`${transactionTypeLabels[transactionType]} valdes endast för ${row.merchant}.`);
-      setErrorMessage('');
+      clearError();
     } catch (error) {
-      setErrorMessage(`Kunde inte uppdatera ekonomisk typ: ${String(error)}`);
+      showUserFacingError(error, 'review-update');
     }
   };
 
   const updateSimilarTransactionTypes = async (row: Transaction, transactionType: TransactionType) => {
     const ids = findExactMerchantTransactionIds(transactions, row.merchant);
-    try {
-      const updated = await invoke<number>('bulk_update_transaction_types', {
-        ids: ids.map(Number),
-        transactionType,
-      });
-      setTransactions((current) => current.map((item) => ids.includes(String(item.id))
-        ? { ...item, transactionType }
-        : item));
-      setTransactionTypeDrafts((current) => {
-        const next = { ...current };
-        ids.forEach((id) => delete next[String(id)]);
-        return next;
-      });
-      await refreshImportBatches();
-      setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för ${updated} liknande transaktioner.`);
-      setErrorMessage('');
-    } catch (error) {
-      setErrorMessage(`Kunde inte uppdatera liknande transaktioner: ${String(error)}`);
-    }
+    await runConfirmedAction(
+      window.confirm,
+      buildBulkConfirmation({
+        kind: 'transaction-type',
+        merchant: row.merchant,
+        count: ids.length,
+        newValue: transactionTypeLabels[transactionType],
+      }),
+      async () => {
+        try {
+          const updated = await invoke<number>('bulk_update_transaction_types', {
+            ids: ids.map(Number),
+            transactionType,
+          });
+          setTransactions((current) => current.map((item) => ids.includes(String(item.id))
+            ? { ...item, transactionType }
+            : item));
+          setTransactionTypeDrafts((current) => {
+            const next = { ...current };
+            ids.forEach((id) => delete next[String(id)]);
+            return next;
+          });
+          await refreshImportBatches();
+          setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för ${updated} befintliga transaktioner med samma butik/mottagare.`);
+          clearError();
+        } catch (error) {
+          showUserFacingError(error, 'review-update');
+        }
+      }
+    );
   };
 
   const rememberTransactionType = async (row: Transaction, transactionType: TransactionType) => {
     const merchantKey = normalizedMerchantKey(row.merchant);
-    try {
-      await invoke('remember_transaction_type', {
-        id: Number(row.id),
-        merchantKey,
-        transactionType,
-      });
-      setTransactions((current) => current.map((item) => item.id === row.id
-        ? { ...item, transactionType }
-        : item));
-      const savedRules = await invoke<LearnedTransactionTypeRule[]>('get_learned_transaction_type_rules');
-      setLearnedTransactionTypeRules(savedRules);
-      setTransactionTypeDrafts((current) => {
-        const next = { ...current };
-        delete next[String(row.id)];
-        return next;
-      });
-      await refreshImportBatches();
-      setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för denna transaktion och koms ihåg framåt.`);
-      setErrorMessage('');
-    } catch (error) {
-      setErrorMessage(`Kunde inte spara ekonomisk typ för framtiden: ${String(error)}`);
-    }
+    await runConfirmedAction(
+      window.confirm,
+      buildRememberForwardConfirmation({
+        kind: 'transaction-type',
+        merchant: row.merchant,
+        newValue: transactionTypeLabels[transactionType],
+      }),
+      async () => {
+        try {
+          await invoke('remember_transaction_type', {
+            id: Number(row.id),
+            merchantKey,
+            transactionType,
+          });
+          setTransactions((current) => current.map((item) => item.id === row.id
+            ? { ...item, transactionType }
+            : item));
+          const savedRules = await invoke<LearnedTransactionTypeRule[]>('get_learned_transaction_type_rules');
+          setLearnedTransactionTypeRules(savedRules);
+          setTransactionTypeDrafts((current) => {
+            const next = { ...current };
+            delete next[String(row.id)];
+            return next;
+          });
+          await refreshImportBatches();
+          setStatusMessage(`${transactionTypeLabels[transactionType]} valdes för denna transaktion och används även för framtida importer från samma butik/mottagare.`);
+          clearError();
+        } catch (error) {
+          showUserFacingError(error, 'review-update');
+        }
+      }
+    );
   };
 
   const rejectCategory = async (row: Transaction) => {
@@ -869,7 +1005,7 @@ export default function App() {
       });
       setStatusMessage(`Kategorin nekades för ${row.merchant}. Posten ligger kvar för manuell granskning.`);
     } catch (error) {
-      setErrorMessage(`Kunde inte neka kategorin: ${String(error)}`);
+      showUserFacingError(error, 'review-update');
     }
   };
 
@@ -881,7 +1017,7 @@ export default function App() {
       await refreshImportBatches();
       setStatusMessage(`${row.merchant} togs bort.`);
     } catch (error) {
-      setErrorMessage(`Kunde inte ta bort transaktionen: ${String(error)}`);
+      showUserFacingError(error, 'transaction-delete');
     }
   };
 
@@ -890,9 +1026,9 @@ export default function App() {
       const detail = await invoke<ImportBatchDetail>('get_import_batch', { id });
       setSelectedImportBatch(detail);
       setActiveTab('import');
-      setErrorMessage('');
+      clearError();
     } catch (error) {
-      setErrorMessage(`Kunde inte läsa importen: ${String(error)}`);
+      showUserFacingError(error, 'import-history');
     }
   };
 
@@ -918,14 +1054,27 @@ export default function App() {
       setExistingImportMatches((current) => current.filter((match) => match.batch.id !== batch.id));
       setSelectedImportBatch(null);
       setStatusMessage(`${batch.fileName} ångrades och ${deletedCount} transaktioner togs bort.`);
-      setErrorMessage('');
+      clearError();
     } catch (error) {
-      setErrorMessage(`Kunde inte ångra importen: ${String(error)}`);
+      showUserFacingError(error, 'import-undo');
     }
   };
 
   const periodLabel = selectedMonth === 'all' ? selectedYear : `${monthNames[Number(selectedMonth) - 1]} ${selectedYear}`;
   const comparisonLabel = selectedMonth === 'all' ? comparisonYear : `${monthNames[Number(selectedMonth) - 1]} ${comparisonYear}`;
+  const dashboardMode = getDashboardMode({
+    transactionCount: transactions.length,
+    selectedMonth,
+    periodStatus,
+  });
+  const dashboardSections = getDashboardSections(dashboardMode);
+  const navigateMonth = (direction: -1 | 1) => {
+    if (selectedMonth === 'all') return;
+    const next = shiftMonth(Number(selectedYear), Number(selectedMonth), direction);
+    setSelectedYear(String(next.year));
+    setSelectedMonth(String(next.month));
+    setSelectedCategory(null);
+  };
   const legacyTransactionCount = transactions.filter((row) => row.importBatchId == null).length;
   const categoryDecisionActions = (row: Transaction, category: string, isDuplicate: boolean) => {
     const exactMatchCount = findExactMerchantTransactionIds(transactions, row.merchant).length;
@@ -936,21 +1085,21 @@ export default function App() {
           disabled={category === 'Okategoriserat'}
           onClick={() => void updateSingleCategory(row, category)}
         >
-          Endast denna
+          Ändra bara den här
         </button>
         <button
           className="bulk-category-btn"
           disabled={category === 'Okategoriserat' || exactMatchCount < 2}
           onClick={() => void updateExactMerchantCategories(row, category)}
         >
-          Ändra {exactMatchCount} liknande
+          Ändra {exactMatchCount} befintliga med samma butik/mottagare
         </button>
         <button
           className="remember-category-btn"
           disabled={category === 'Okategoriserat' || normalizedMerchantKey(row.merchant) === 'OKÄND MERCHANT'}
           onClick={() => void rememberCategoryForFuture(row, category)}
         >
-          Kom ihåg framåt
+          Använd även för framtida importer
         </button>
         {isDuplicate && (
           <button
@@ -970,7 +1119,7 @@ export default function App() {
         <h4>{title} ({issues.length})</h4>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Sheet</th><th>Rad</th><th>Fält</th><th>Originalvärde</th><th>Problem</th></tr></thead>
+            <thead><tr><th>Blad</th><th>Rad</th><th>Fält</th><th>Originalvärde</th><th>Problem</th></tr></thead>
             <tbody>
               {issues.map((issue, index) => (
                 <tr key={`${issue.sheet}-${issue.rowNumber}-${issue.code}-${index}`}>
@@ -987,6 +1136,42 @@ export default function App() {
       </section>
     )
   );
+
+  if (fatalDatabaseError) {
+    return (
+      <main className="app-shell">
+        <aside className="sidebar">
+          <div className="brand-block">
+            <div className="brand-mark">B</div>
+            <div><p className="eyebrow">Lokal ekonomi</p><h1>BudgetApp</h1></div>
+          </div>
+          <div className="db-box">
+            <span>LOKAL SQLITE</span>
+            <strong>Databasen är inte tillgänglig</strong>
+            <small>{dbStatus}</small>
+          </div>
+        </aside>
+        <section className="content fatal-database-state" role="alert">
+          <article className="panel">
+            <p className="eyebrow">Databasen kunde inte öppnas</p>
+            <h2>BudgetApp kunde inte öppna databasen</h2>
+            <p>{fatalDatabaseError.message}</p>
+            <p>Normal översikt visas inte förrän databasen kan läsas säkert.</p>
+            {fatalDatabaseError.dataLocation && (
+              <p>Den lokala databasen finns här: <code>{fatalDatabaseError.dataLocation}</code></p>
+            )}
+            <button className="primary-btn" onClick={() => void initializeDatabase()}>
+              Försök igen
+            </button>
+            <details>
+              <summary>Visa teknisk information</summary>
+              <pre>{fatalDatabaseError.technicalDetails}</pre>
+            </details>
+          </article>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -1007,21 +1192,57 @@ export default function App() {
         <header className="topbar">
           <div><p className="eyebrow">{selectedCategory && activeTab === 'overview' ? `${selectedCategory} / ${periodLabel}` : `Transaktioner / ${periodLabel}`}</p><h2>{activeTab === 'overview' ? selectedCategory ? `${selectedCategoryFlow === 'income' ? 'Inkomster' : 'Utgifter'} · ${selectedCategory}` : 'Ekonomisk översikt' : activeTab === 'import' ? 'Importera bankfiler' : 'Transaktioner att granska'}</h2></div>
           {activeTab === 'overview' && selectedCategory && <button className="text-button" onClick={() => setSelectedCategory(null)}>Tillbaka till översikt</button>}
-          <button className="primary-btn" disabled={!dbReady} onClick={() => setActiveTab('import')}>+ Importera Excel</button>
+          {!(activeTab === 'overview' && dashboardMode === 'first-run') && (
+            <button className="primary-btn" disabled={!dbReady || isAnalyzingImport || isImporting} onClick={() => setActiveTab('import')}>+ Importera Excel</button>
+          )}
         </header>
 
         {statusMessage && <p className="status-message" role="status">{statusMessage}</p>}
-        {errorMessage && <p className="error-message" role="alert">{errorMessage}</p>}
+        {errorMessage && (
+          <div className="error-message" role="alert">
+            <p>{errorMessage}</p>
+            {errorTechnicalDetails && (
+              <details>
+                <summary>Visa teknisk information</summary>
+                <pre>{errorTechnicalDetails}</pre>
+              </details>
+            )}
+          </div>
+        )}
 
-        <div className="filter-bar">
-          <label>År<select value={selectedYear} onChange={(event) => setSelectedYear(event.target.value)}>{yearOptions.map((year) => <option key={year} value={year}>{year}</option>)}</select></label>
-          <label>Månad<select value={selectedMonth} onChange={(event) => setSelectedMonth(event.target.value)}><option value="all">Hela året</option>{monthNames.map((month, index) => <option key={month} value={String(index + 1)}>{month}</option>)}</select></label>
-          <label>Jämför med<select value={comparisonYear} onChange={(event) => setComparisonYear(event.target.value)}>{yearOptions.filter((year) => year !== selectedYear).map((year) => <option key={year} value={year}>{year}</option>)}</select></label>
-          <span className="period-count">{reportTransactions.length.toLocaleString('sv-SE')} transaktioner i perioden</span>
-        </div>
+        {transactions.length > 0 && (
+          <div className="filter-bar">
+            <label>År<select value={selectedYear} onChange={(event) => setSelectedYear(event.target.value)}>{yearOptions.map((year) => <option key={year} value={year}>{year}</option>)}</select></label>
+            <label>Månad<select value={selectedMonth} onChange={(event) => setSelectedMonth(event.target.value)}><option value="all">Hela året</option>{monthNames.map((month, index) => <option key={month} value={String(index + 1)}>{month}</option>)}</select></label>
+            {selectedMonth !== 'all' && (
+              <div className="period-navigation" aria-label="Månadsnavigation">
+                <button type="button" aria-label="Föregående månad" onClick={() => navigateMonth(-1)}>←</button>
+                <strong>{periodLabel}</strong>
+                {periodStatus === 'future' && <span>Planering</span>}
+                <button type="button" aria-label="Nästa månad" onClick={() => navigateMonth(1)}>→</button>
+              </div>
+            )}
+            <label>Jämför med<select value={comparisonYear} onChange={(event) => setComparisonYear(event.target.value)}>{yearOptions.filter((year) => year !== selectedYear).map((year) => <option key={year} value={year}>{year}</option>)}</select></label>
+            <span className="period-count">{reportTransactions.length.toLocaleString('sv-SE')} transaktioner i perioden</span>
+          </div>
+        )}
 
-        {activeTab === 'overview' && !selectedCategory && (
-          <>
+        {dbReady && activeTab === 'overview' && !selectedCategory && dashboardMode === 'first-run' && (
+          <section className="first-run" aria-labelledby="first-run-title">
+            <div className="first-run-mark" aria-hidden="true">B</div>
+            <p className="eyebrow">Din ekonomi, lokalt</p>
+            <h2 id="first-run-title">{firstRunCopy.title}</h2>
+            <p className="first-run-description">{firstRunCopy.description}</p>
+            <p className="first-run-privacy">{firstRunCopy.privacy}</p>
+            <button className="primary-btn" type="button" onClick={() => setActiveTab('import')}>
+              {firstRunCopy.action}
+            </button>
+            <small>{firstRunCopy.fileHelp}</small>
+          </section>
+        )}
+
+        {activeTab === 'overview' && !selectedCategory && dashboardMode !== 'first-run' && (
+          <div className="overview-sections">
             <article className={`panel health-panel ${financialHealth?.status ?? 'year-view'}`}>
               <div className="panel-header">
                 <div>
@@ -1029,7 +1250,9 @@ export default function App() {
                   <span>{periodLabel}</span>
                 </div>
               </div>
-              {financialHealth == null ? (
+              {periodStatus === 'future' ? (
+                <p className="empty-state">Den här perioden har inte börjat ännu. Budgeten kan planeras, men utfall och ekonomiska bedömningar visas först när perioden börjar.</p>
+              ) : financialHealth == null ? (
                 <p className="empty-state">Välj en månad för prioriterade ekonomiska insikter.</p>
               ) : (
                 <>
@@ -1043,7 +1266,7 @@ export default function App() {
                         <section className={`health-card ${insight.severity}`} key={insight.id}>
                           <span className="health-severity">
                             {insight.severity === 'important'
-                              ? 'Viktigt'
+                              ? 'Behöver uppmärksamhet'
                               : insight.severity === 'attention'
                                 ? 'Att se över'
                                 : insight.severity === 'positive'
@@ -1058,21 +1281,45 @@ export default function App() {
                     </div>
                   )}
                   {financialHealth.hiddenCount > 0 && (
-                    <p className="health-more">+{financialHealth.hiddenCount} fler insikter finns i detaljsektionerna nedan.</p>
+                    <p className="health-more">+{financialHealth.hiddenCount} fler insikter finns under Fördjupad analys.</p>
                   )}
                 </>
               )}
             </article>
 
-            <div className="stats-grid">
+            {dashboardSections.includes('summary') && <div className="stats-grid">
               <article className="stat-card expense"><span>Konsumtionsutgifter</span><strong>{formatMoney(summary.current.consumptionExpensesCents)}</strong><small>{formatMoney(summary.current.consumptionExpensesCents - summary.comparison.consumptionExpensesCents)} mot {comparisonLabel}</small></article>
               <article className="stat-card income"><span>Inkomster</span><strong>{formatMoney(summary.current.incomeCents)}</strong><small>{formatMoney(summary.current.incomeCents - summary.comparison.incomeCents)} mot {comparisonLabel}</small></article>
               <article className="stat-card save"><span>Sparande</span><strong>{formatMoney(summary.current.directSavingsCents)}</strong><small>direkt sparande</small></article>
               <article className="stat-card save"><span>Amortering</span><strong>{formatMoney(summary.current.amortizationCents)}</strong><small>{formatMoney(summary.current.totalWealthBuildingCents)} totalt inkl. amortering</small></article>
               <article className="stat-card neutral"><span>Kvar efter utgifter &amp; sparande</span><strong>{formatMoney(summary.current.remainingAfterSpendingAndSavingCents)}</strong><small>{formatMoney(summary.current.remainingAfterSpendingAndSavingCents - summary.comparison.remainingAfterSpendingAndSavingCents)} mot {comparisonLabel}</small></article>
-              <article className="stat-card save"><span>Behöver granskas</span><strong>{reportTransactions.filter((row) => needsCategoryDecision(row, duplicateIds.has(String(row.id)))).length}</strong><small>{summary.current.unclassifiedCount} behöver ekonomisk klassificering</small></article>
-            </div>
+            </div>}
 
+            {dashboardSections.includes('review') && pendingReviewTransactions.length > 0 && (
+              <section className="review-callout" aria-label="Transaktioner som behöver granskas">
+                <div>
+                  <strong>
+                    {pendingReviewTransactions.length === 1
+                      ? '1 transaktion behöver granskas'
+                      : `${pendingReviewTransactions.length} transaktioner behöver granskas`}
+                  </strong>
+                  <span>Kontrollera osäkra kategorier, ekonomisk typ och möjliga dubletter.</span>
+                </div>
+                <button type="button" onClick={() => setActiveTab('review')}>Granska</button>
+              </section>
+            )}
+
+            {dashboardSections.includes('deep-analysis') && (
+            <details
+              className="deep-analysis"
+              open={deepAnalysisOpen}
+              onToggle={(event) => setDeepAnalysisOpen(event.currentTarget.open)}
+            >
+              <summary>
+                <span>Fördjupad analys</span>
+                <small>Förändringar, återkommande kostnader och långsiktiga trender</small>
+              </summary>
+              <div className="deep-analysis-content">
             <article className="panel insights-panel">
               <div className="panel-header">
                 <div>
@@ -1080,7 +1327,9 @@ export default function App() {
                   <span>{monthlyInsights?.baselineLabel ?? 'Månadsanalys av konsumtionsutgifter'}</span>
                 </div>
               </div>
-              {selectedMonth === 'all' ? (
+              {periodStatus === 'future' ? (
+                <p className="empty-state">Den här perioden har inte börjat ännu.</p>
+              ) : selectedMonth === 'all' ? (
                 <p className="empty-state">Välj en avslutad månad för att se förändringsanalysen.</p>
               ) : monthlyInsights?.status === 'incomplete-month' ? (
                 <p className="empty-state">Förändringsanalys visas när månaden är avslutad.</p>
@@ -1163,10 +1412,12 @@ export default function App() {
               <div className="panel-header">
                 <div>
                   <h3>Återkommande kostnader</h3>
-                  <span>Härlett lokalt från upp till 12 månaders expense-transaktioner</span>
+                  <span>Beräknat lokalt från upp till 12 månaders utgifter</span>
                 </div>
               </div>
-              {recurringInsights.status === 'insufficient-history' ? (
+              {periodStatus === 'future' || recurringInsights == null ? (
+                <p className="empty-state">Den här perioden har inte börjat ännu.</p>
+              ) : recurringInsights.status === 'insufficient-history' ? (
                 <p className="empty-state">Mer historik behövs för att identifiera återkommande kostnader.</p>
               ) : recurringInsights.status === 'no-candidates' ? (
                 <p className="empty-state">Inga tydligt återkommande kostnader hittades ännu.</p>
@@ -1219,7 +1470,9 @@ export default function App() {
                   <span>Jämför robusta medianer från tidigare och senaste betalningar</span>
                 </div>
               </div>
-              {recurringCostTrends.status === 'insufficient-history' ? (
+              {periodStatus === 'future' || recurringCostTrends == null ? (
+                <p className="empty-state">Den här perioden har inte börjat ännu.</p>
+              ) : recurringCostTrends.status === 'insufficient-history' ? (
                 <p className="empty-state">Mer historik behövs för att analysera kostnadstrender.</p>
               ) : recurringCostTrends.increasing.length === 0 ? (
                 <p className="empty-state">Inga tydliga långsiktiga kostnadsökningar hittades.</p>
@@ -1254,6 +1507,9 @@ export default function App() {
                 </div>
               )}
             </article>
+              </div>
+            </details>
+            )}
 
             <div className="dashboard-grid">
               <article className="panel chart-panel">
@@ -1270,38 +1526,137 @@ export default function App() {
             </div>
 
             <article className="panel budget-panel">
-              <div className="panel-header"><div><h3>Konsumtionsbudget mot utfall</h3><span>{selectedMonth === 'all' ? `Årsbudget ${selectedYear} · ${budgetedMonthCount} av 12 månader budgeterade` : `Månadsbudget · ${periodLabel}`}</span></div>{categoryRows.length > 10 && <button className="text-button" onClick={() => setShowAllExpenseCategories((show) => !show)}>{showAllExpenseCategories ? 'Visa färre' : `Visa alla ${categoryRows.length}`}</button>}</div>
-              <p className="budget-hint">Historiskt snitt baseras på {consumptionBudget.coveredMonths.length} avslutade konsumtionsmånader. Prognos visas separat och kräver minst 2 avslutade månader.</p>
+              <div className="panel-header"><div><h3>Konsumtionsbudget mot utfall</h3><span>{selectedMonth === 'all' ? `Årsbudget ${selectedYear} · Du har angett månadsbudget för ${budgetedMonthCount} av årets 12 månader.` : `Månadsbudget · ${periodLabel}`}</span></div>{categoryRows.length > 10 && <button className="text-button" onClick={() => setShowAllExpenseCategories((show) => !show)}>{showAllExpenseCategories ? 'Visa färre' : `Visa alla ${categoryRows.length}`}</button>}</div>
               {selectedMonth === 'all' && <p className="budget-hint">Välj en månad för att ändra budget. Saknade budgetmånader fylls inte automatiskt med 0 kr.</p>}
-              <div className="category-table-wrap"><table className="category-table"><thead><tr><th>Kategori</th><th>Utfall</th><th>Historiskt snitt</th><th>Prognos</th><th>Budget</th><th>Kvar</th><th>Använt</th><th>Budget</th></tr></thead><tbody>
-                {visibleExpenseRows.map((item) => <tr key={item.category}><td><button className="category-link" onClick={() => { setSelectedCategoryFlow('expense'); setSelectedCategory(item.category); }}>{item.category}</button></td><td>{formatMoney(item.actualCents)}</td><td>{item.historicalMonthlyAverageCents == null ? '—' : `${formatMoney(item.historicalMonthlyAverageCents)}/mån`}</td><td>{item.forecastAnnualCents == null ? 'Otillräcklig data' : `${formatMoney(item.forecastAnnualCents)}/år uppskattning`}</td><td>{item.hasBudget ? formatMoney(item.budgetCents) : 'Ej angiven'}</td><td className={item.hasBudget && item.actualCents > item.budgetCents ? 'over-budget' : ''}>{item.hasBudget ? formatMoney(item.remainingCents) : '—'}</td><td>{item.percentUsed == null ? '—' : `${item.percentUsed.toLocaleString('sv-SE', { maximumFractionDigits: 1 })} %`}</td><td><div className="budget-editor"><input aria-label={`Budget ${item.category}`} type="number" min="0" step="100" disabled={selectedMonth === 'all'} value={budgetDrafts[item.category] ?? ''} placeholder="0" onChange={(event) => setBudgetDrafts((current) => ({ ...current, [item.category]: event.target.value }))} /><button disabled={selectedMonth === 'all'} onClick={() => void saveBudget(item.category)}>Spara</button></div></td></tr>)}
+              <div className="category-table-wrap"><table className="category-table"><thead><tr><th>Kategori</th><th>Utfall</th><th>Budget</th><th>Kvar / över</th><th>Använt</th><th>Ändra budget</th></tr></thead><tbody>
+                {visibleExpenseRows.map((item) => <tr key={item.category}><td><button className="category-link" onClick={() => { setSelectedCategoryFlow('expense'); setSelectedCategory(item.category); }}>{item.category}</button></td><td>{periodStatus === 'future' ? '—' : formatMoney(item.actualCents)}</td><td>{item.hasBudget ? formatMoney(item.budgetCents) : 'Ej angiven'}</td><td className={periodStatus !== 'future' && item.hasBudget && item.actualCents > item.budgetCents ? 'over-budget' : ''}>{periodStatus !== 'future' && item.hasBudget ? formatMoney(item.remainingCents) : '—'}</td><td>{periodStatus === 'future' || item.percentUsed == null ? '—' : `${item.percentUsed.toLocaleString('sv-SE', { maximumFractionDigits: 1 })} %`}</td><td><div className="budget-editor"><input aria-label={`Budget ${item.category}`} type="number" min="0" step="100" disabled={selectedMonth === 'all'} value={budgetDrafts[item.category] ?? ''} placeholder="0" onChange={(event) => setBudgetDrafts((current) => ({ ...current, [item.category]: event.target.value }))} /><button disabled={selectedMonth === 'all'} onClick={() => void saveBudget(item.category)}>Spara</button></div></td></tr>)}
               </tbody></table></div>
+              <details className="budget-context">
+                <summary>Visa historiska snitt och prognoser</summary>
+                <p>Historiskt snitt baseras på {consumptionBudget.coveredMonths.length} avslutade konsumtionsmånader. Prognos kräver minst 2 avslutade månader.</p>
+                <div className="table-wrap"><table><thead><tr><th>Kategori</th><th>Historiskt snitt</th><th>Prognos</th></tr></thead><tbody>
+                  {visibleExpenseRows.map((item) => <tr key={item.category}><td>{item.category}</td><td>{item.historicalMonthlyAverageCents == null ? '—' : `${formatMoney(item.historicalMonthlyAverageCents)}/mån`}</td><td>{item.forecastAnnualCents == null ? 'Otillräcklig data' : `${formatMoney(item.forecastAnnualCents)}/år uppskattning`}</td></tr>)}
+                </tbody></table></div>
+              </details>
             </article>
 
             <article className="panel budget-panel income-budget-panel">
-              <div className="panel-header"><div><h3>Inkomster mot mål</h3><span>Historiskt snitt baserat på {incomeBudget.coveredMonths.length} avslutade inkomstmånader</span></div>{incomeRows.length > 10 && <button className="text-button" onClick={() => setShowAllIncomeCategories((show) => !show)}>{showAllIncomeCategories ? 'Visa färre' : `Visa alla ${incomeRows.length}`}</button>}</div>
-              <div className="category-table-wrap"><table className="category-table"><thead><tr><th>Kategori</th><th>Utfall</th><th>Historiskt snitt</th><th>Prognos</th><th>Mål</th><th>Över / under</th><th>Månadsbudget</th></tr></thead><tbody>
-                {visibleIncomeRows.map((item) => <tr key={item.category}><td><button className="category-link" onClick={() => { setSelectedCategoryFlow('income'); setSelectedCategory(item.category); }}>{item.category}</button></td><td>{formatMoney(item.actualCents)}</td><td>{item.historicalMonthlyAverageCents == null ? '—' : `${formatMoney(item.historicalMonthlyAverageCents)}/mån`}</td><td>{item.forecastAnnualCents == null ? 'Otillräcklig data' : `${formatMoney(item.forecastAnnualCents)}/år uppskattning`}</td><td>{item.hasBudget ? formatMoney(item.budgetCents) : 'Ej angivet'}</td><td className={item.hasBudget ? (item.actualCents >= item.budgetCents ? 'income-on-target' : 'income-under-target') : ''}>{item.hasBudget ? formatMoney(item.actualCents - item.budgetCents) : '—'}</td><td><div className="budget-editor"><input aria-label={`Månadsbudget för inkomst ${item.category}`} type="number" min="0" step="100" disabled={selectedMonth === 'all'} value={budgetDrafts[item.category] ?? ''} placeholder="0" onChange={(event) => setBudgetDrafts((current) => ({ ...current, [item.category]: event.target.value }))} /><button disabled={selectedMonth === 'all'} onClick={() => void saveBudget(item.category)}>Spara</button></div></td></tr>)}
+              <div className="panel-header"><div><h3>Inkomster mot mål</h3><span>Mål och utfall för vald period</span></div>{incomeRows.length > 10 && <button className="text-button" onClick={() => setShowAllIncomeCategories((show) => !show)}>{showAllIncomeCategories ? 'Visa färre' : `Visa alla ${incomeRows.length}`}</button>}</div>
+              <div className="category-table-wrap"><table className="category-table"><thead><tr><th>Kategori</th><th>Utfall</th><th>Mål</th><th>Över / under</th><th>Ändra mål</th></tr></thead><tbody>
+                {visibleIncomeRows.map((item) => <tr key={item.category}><td><button className="category-link" onClick={() => { setSelectedCategoryFlow('income'); setSelectedCategory(item.category); }}>{item.category}</button></td><td>{periodStatus === 'future' ? '—' : formatMoney(item.actualCents)}</td><td>{item.hasBudget ? formatMoney(item.budgetCents) : 'Ej angivet'}</td><td className={periodStatus !== 'future' && item.hasBudget ? (item.actualCents >= item.budgetCents ? 'income-on-target' : 'income-under-target') : ''}>{periodStatus !== 'future' && item.hasBudget ? formatMoney(item.actualCents - item.budgetCents) : '—'}</td><td><div className="budget-editor"><input aria-label={`Månadsbudget för inkomst ${item.category}`} type="number" min="0" step="100" disabled={selectedMonth === 'all'} value={budgetDrafts[item.category] ?? ''} placeholder="0" onChange={(event) => setBudgetDrafts((current) => ({ ...current, [item.category]: event.target.value }))} /><button disabled={selectedMonth === 'all'} onClick={() => void saveBudget(item.category)}>Spara</button></div></td></tr>)}
               </tbody></table></div>
+              <details className="budget-context">
+                <summary>Visa historiska snitt och prognoser</summary>
+                <p>Historiskt snitt baseras på {incomeBudget.coveredMonths.length} avslutade inkomstmånader.</p>
+                <div className="table-wrap"><table><thead><tr><th>Kategori</th><th>Historiskt snitt</th><th>Prognos</th></tr></thead><tbody>
+                  {visibleIncomeRows.map((item) => <tr key={item.category}><td>{item.category}</td><td>{item.historicalMonthlyAverageCents == null ? '—' : `${formatMoney(item.historicalMonthlyAverageCents)}/mån`}</td><td>{item.forecastAnnualCents == null ? 'Otillräcklig data' : `${formatMoney(item.forecastAnnualCents)}/år uppskattning`}</td></tr>)}
+                </tbody></table></div>
+              </details>
             </article>
 
             <article className="panel budget-panel income-budget-panel">
-              <div className="panel-header"><div><h3>Sparmål och amorteringsmål</h3><span>Totalt förmögenhetsbyggande i perioden: {formatMoney(summary.current.totalWealthBuildingCents)}</span></div></div>
-              {wealthGoalRows.length ? <div className="category-table-wrap"><table className="category-table"><thead><tr><th>Måltyp</th><th>Kategori</th><th>Utfall</th><th>Historiskt snitt</th><th>Prognos</th><th>Mål</th><th>Kvar till mål</th><th>Månadsbudget</th></tr></thead><tbody>
-                {wealthGoalRows.map((item) => <tr key={`${item.goalLabel}-${item.category}`}><td>{item.goalLabel}</td><td><button className="category-link" onClick={() => { setSelectedCategoryFlow('income'); setSelectedCategory(item.category); }}>{item.category}</button></td><td>{formatMoney(item.actualCents)}</td><td>{item.historicalMonthlyAverageCents == null ? '—' : `${formatMoney(item.historicalMonthlyAverageCents)}/mån`}</td><td>{item.forecastAnnualCents == null ? 'Otillräcklig data' : `${formatMoney(item.forecastAnnualCents)}/år uppskattning`}</td><td>{item.hasBudget ? formatMoney(item.budgetCents) : 'Ej angivet'}</td><td>{item.hasBudget ? formatMoney(item.remainingCents) : '—'}</td><td><div className="budget-editor"><input aria-label={`${item.goalLabel} ${item.category}`} type="number" min="0" step="100" disabled={selectedMonth === 'all'} value={budgetDrafts[item.category] ?? ''} placeholder="0" onChange={(event) => setBudgetDrafts((current) => ({ ...current, [item.category]: event.target.value }))} /><button disabled={selectedMonth === 'all'} onClick={() => void saveBudget(item.category)}>Spara</button></div></td></tr>)}
-              </tbody></table></div> : <p className="empty-state">Inga spar- eller amorteringsmål för vald period.</p>}
+              <div className="panel-header"><div><h3>Sparmål och amorteringsmål</h3><span>{periodStatus === 'future' ? 'Planering för en framtida period' : `Totalt förmögenhetsbyggande i perioden: ${formatMoney(summary.current.totalWealthBuildingCents)}`}</span></div></div>
+              {wealthGoalRows.length ? <>
+                <div className="category-table-wrap"><table className="category-table"><thead><tr><th>Måltyp</th><th>Kategori</th><th>Utfall</th><th>Mål</th><th>Kvar till mål</th><th>Ändra mål</th></tr></thead><tbody>
+                  {wealthGoalRows.map((item) => <tr key={`${item.goalLabel}-${item.category}`}><td>{item.goalLabel}</td><td><button className="category-link" onClick={() => { setSelectedCategoryFlow('income'); setSelectedCategory(item.category); }}>{item.category}</button></td><td>{periodStatus === 'future' ? '—' : formatMoney(item.actualCents)}</td><td>{item.hasBudget ? formatMoney(item.budgetCents) : 'Ej angivet'}</td><td>{periodStatus !== 'future' && item.hasBudget ? formatMoney(item.remainingCents) : '—'}</td><td><div className="budget-editor"><input aria-label={`${item.goalLabel} ${item.category}`} type="number" min="0" step="100" disabled={selectedMonth === 'all'} value={budgetDrafts[item.category] ?? ''} placeholder="0" onChange={(event) => setBudgetDrafts((current) => ({ ...current, [item.category]: event.target.value }))} /><button disabled={selectedMonth === 'all'} onClick={() => void saveBudget(item.category)}>Spara</button></div></td></tr>)}
+                </tbody></table></div>
+                <details className="budget-context">
+                  <summary>Visa historiska snitt och prognoser</summary>
+                  <div className="table-wrap"><table><thead><tr><th>Måltyp</th><th>Kategori</th><th>Historiskt snitt</th><th>Prognos</th></tr></thead><tbody>
+                    {wealthGoalRows.map((item) => <tr key={`${item.goalLabel}-${item.category}`}><td>{item.goalLabel}</td><td>{item.category}</td><td>{item.historicalMonthlyAverageCents == null ? '—' : `${formatMoney(item.historicalMonthlyAverageCents)}/mån`}</td><td>{item.forecastAnnualCents == null ? 'Otillräcklig data' : `${formatMoney(item.forecastAnnualCents)}/år uppskattning`}</td></tr>)}
+                  </tbody></table></div>
+                </details>
+              </> : <p className="empty-state">Inga spar- eller amorteringsmål för vald period.</p>}
             </article>
 
             <article className="panel transactions-panel">
               <div className="panel-header"><div><h3>Transaktioner</h3><span>{reportTransactions.length.toLocaleString('sv-SE')} poster i rapporten</span></div><button className="text-button" onClick={() => setActiveTab('review')}>Granska alla</button></div>
               {reportTransactions.length ? <div className="table-wrap"><table><thead><tr><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Typ</th></tr></thead><tbody>{reportTransactions.slice(0, 20).map((row) => <tr key={row.id}><td>{row.date}</td><td>{row.merchant}</td><td className={row.amountCents < 0 ? 'amount-expense' : 'amount-income'}>{formatMoney(row.amountCents)}</td><td>{row.category}{row.needsReview && <span className="review-tag">Granska</span>}</td><td>{transactionTypeLabels[row.transactionType]}{row.transactionType === 'unclassified' && <span className="review-tag">Klassificera</span>}</td></tr>)}</tbody></table></div> : <p className="empty-state">Ingen data för perioden. Importera en eller flera bankfiler för att börja bygga din översikt.</p>}
             </article>
-          </>
+          </div>
         )}
 
         {activeTab === 'overview' && selectedCategory && <article className="panel category-detail"><div className="panel-header"><div><h3>{selectedCategoryFlow === 'income' ? 'Inkomster och sparande i' : 'Utgifter i'} {selectedCategory}</h3><span>{periodLabel} · {selectedCategoryTransactions.length} poster</span></div><strong className="category-detail-total">{formatMoney(displayedCategoryTotal)}</strong></div>{selectedCategoryTransactions.length ? <div className="table-wrap"><table><thead><tr><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Importerad från</th></tr></thead><tbody>{selectedCategoryTransactions.map((row) => { const rowId = String(row.id); const isDuplicate = duplicateIds.has(rowId); const rowCategory = categoryDrafts[rowId] ?? row.category; const showCategoryDecision = (!row.categoryDecided && isDuplicate) || rowCategory !== row.category; const displayedAmount = amountForCategoryFlow(row, selectedCategory, selectedCategoryFlow); return <tr key={row.id}><td>{row.date}</td><td>{row.merchant}</td><td className={displayedAmount < 0 ? 'amount-expense' : 'amount-income'}>{formatMoney(displayedAmount)}</td><td><CategoryPicker label={`Kategori för ${row.merchant}`} value={rowCategory} categories={categoryOptions} onChange={(category) => selectCategory(row, category)} />{showCategoryDecision && categoryDecisionActions(row, rowCategory, isDuplicate)}</td><td>{row.sourceFile || '—'}</td></tr>;})}</tbody></table></div> : <p className="empty-state">Inga poster i kategorin för vald period.</p>}</article>}
 
-        {activeTab === 'review' && <article className="panel review-panel"><div className="panel-header"><div><h3>Alla transaktioner</h3><span>{periodLabel} · {visibleReviewTransactions.length} visas · {pendingReviewTransactions.length} behöver kontrolleras</span></div><label className="review-filter">Visa<select value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value as ReviewFilter)}><option value="pending">Behöver kontrolleras ({pendingReviewTransactions.length})</option><option value="checked">Kontrollerade ({reviewTransactions.length - pendingReviewTransactions.length})</option><option value="all">Alla ({reviewTransactions.length})</option></select></label></div>{visibleReviewTransactions.length ? <div className="table-wrap"><table><thead><tr><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Ekonomisk typ</th><th>Kontroll</th><th>Åtgärd</th></tr></thead><tbody>{visibleReviewTransactions.map((row) => { const rowId = String(row.id); const isDuplicate = duplicateIds.has(rowId); const selectedCategory = categoryDrafts[rowId] ?? row.category; const showCategoryDecision = (!row.categoryDecided && isDuplicate) || selectedCategory !== row.category; const selectedTransactionType = transactionTypeDrafts[rowId] ?? row.transactionType; const showTransactionTypeDecision = selectedTransactionType !== row.transactionType; const similarTransactionCount = findExactMerchantTransactionIds(transactions, row.merchant).length; return <tr key={row.id}><td>{row.date}</td><td>{row.merchant}</td><td>{formatMoney(row.amountCents)}</td><td><CategoryPicker label={`Kategori för ${row.merchant}`} value={selectedCategory} categories={categoryOptions} onChange={(category) => selectCategory(row, category)} />{showCategoryDecision && categoryDecisionActions(row, selectedCategory, isDuplicate)}</td><td><select aria-label={`Ekonomisk typ för ${row.merchant}`} value={selectedTransactionType} onChange={(event) => setTransactionTypeDrafts((current) => ({ ...current, [rowId]: event.target.value as TransactionType }))}>{transactionTypes.map((type) => <option key={type} value={type}>{transactionTypeLabels[type]}</option>)}</select>{showTransactionTypeDecision && <div className="category-decision-actions"><button onClick={() => void updateTransactionType(row, selectedTransactionType)}>Endast denna</button><button onClick={() => void updateSimilarTransactionTypes(row, selectedTransactionType)}>Ändra {similarTransactionCount} liknande</button><button onClick={() => void rememberTransactionType(row, selectedTransactionType)}>Kom ihåg framåt</button></div>}</td><td>{isDuplicate && <span className="duplicate-tag">Möjlig dublett</span>}{isDuplicate && row.categoryDecided && <span className="clear-tag">Kategori godkänd</span>}{row.needsReview && <span className="review-tag">Osäker kategori</span>}{row.transactionType === 'unclassified' && <span className="review-tag">Oklassificerad typ</span>}{!isDuplicate && !row.needsReview && row.transactionType !== 'unclassified' && <span className="clear-tag">Kontrollerad</span>}</td><td><button className="delete-btn" onClick={() => void deleteTransaction(row)}>Ta bort</button></td></tr>;})}</tbody></table></div> : <p className="empty-state">{reviewFilter === 'pending' ? 'Inga poster behöver kontrolleras i den här perioden.' : reviewFilter === 'checked' ? 'Inga kontrollerade poster i den här perioden.' : 'Inga transaktioner i den här perioden.'}</p>}</article>}
+        {activeTab === 'review' && (
+          <article className="panel review-panel">
+            <div className="panel-header">
+              <div>
+                <h3>Alla transaktioner</h3>
+                <span>{periodLabel} · {visibleReviewTransactions.length} visas · {pendingReviewTransactions.length} behöver kontrolleras</span>
+              </div>
+              <label className="review-filter">
+                Visa
+                <select value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value as ReviewFilter)}>
+                  <option value="pending">Behöver kontrolleras ({pendingReviewTransactions.length})</option>
+                  <option value="checked">Kontrollerade ({reviewTransactions.length - pendingReviewTransactions.length})</option>
+                  <option value="all">Alla ({reviewTransactions.length})</option>
+                </select>
+              </label>
+            </div>
+            <div className="review-explanation">
+              <p><strong>Kategori</strong> beskriver vad köpet gäller, till exempel Mat eller Boende.</p>
+              <p><strong>Ekonomisk typ</strong> bestämmer hur transaktionen påverkar Inkomster, Utgifter, Sparande och övriga beräkningar.</p>
+            </div>
+            {visibleReviewTransactions.length ? (
+              <div className="table-wrap">
+                <table>
+                  <thead><tr><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Ekonomisk typ</th><th>Kontroll</th><th>Åtgärd</th></tr></thead>
+                  <tbody>
+                    {visibleReviewTransactions.map((row) => {
+                      const rowId = String(row.id);
+                      const isDuplicate = duplicateIds.has(rowId);
+                      const selectedCategory = categoryDrafts[rowId] ?? row.category;
+                      const showCategoryDecision = (!row.categoryDecided && isDuplicate) || selectedCategory !== row.category;
+                      const selectedTransactionType = transactionTypeDrafts[rowId] ?? row.transactionType;
+                      const showTransactionTypeDecision = selectedTransactionType !== row.transactionType;
+                      const similarTransactionCount = findExactMerchantTransactionIds(transactions, row.merchant).length;
+                      return (
+                        <tr key={row.id}>
+                          <td>{row.date}</td>
+                          <td>{row.merchant}</td>
+                          <td>{formatMoney(row.amountCents)}</td>
+                          <td>
+                            <CategoryPicker label={`Kategori för ${row.merchant}`} value={selectedCategory} categories={categoryOptions} onChange={(category) => selectCategory(row, category)} />
+                            {showCategoryDecision && categoryDecisionActions(row, selectedCategory, isDuplicate)}
+                          </td>
+                          <td>
+                            <select aria-label={`Ekonomisk typ för ${row.merchant}`} value={selectedTransactionType} onChange={(event) => setTransactionTypeDrafts((current) => ({ ...current, [rowId]: event.target.value as TransactionType }))}>
+                              {transactionTypes.map((type) => <option key={type} value={type}>{transactionTypeLabels[type]}</option>)}
+                            </select>
+                            {showTransactionTypeDecision && (
+                              <div className="category-decision-actions">
+                                <button onClick={() => void updateTransactionType(row, selectedTransactionType)}>Ändra bara den här</button>
+                                <button onClick={() => void updateSimilarTransactionTypes(row, selectedTransactionType)}>Ändra {similarTransactionCount} befintliga med samma butik/mottagare</button>
+                                <button onClick={() => void rememberTransactionType(row, selectedTransactionType)}>Använd även för framtida importer</button>
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            {isDuplicate && <span className="duplicate-tag">Möjlig dublett</span>}
+                            {isDuplicate && row.categoryDecided && <span className="clear-tag">Kategori godkänd</span>}
+                            {row.needsReview && <span className="review-tag">Osäker kategori</span>}
+                            {row.transactionType === 'unclassified' && <span className="review-tag">Oklassificerad typ</span>}
+                            {!isDuplicate && !row.needsReview && row.transactionType !== 'unclassified' && <span className="clear-tag">Kontrollerad</span>}
+                          </td>
+                          <td><button className="delete-btn" onClick={() => void deleteTransaction(row)}>Ta bort</button></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="empty-state">
+                {reviewFilter === 'pending'
+                  ? 'Inga poster behöver kontrolleras i den här perioden.'
+                  : reviewFilter === 'checked'
+                    ? 'Inga kontrollerade poster i den här perioden.'
+                    : 'Inga transaktioner i den här perioden.'}
+              </p>
+            )}
+          </article>
+        )}
 
         {activeTab === 'import' && (
           <article className="panel import-panel">
@@ -1309,9 +1664,61 @@ export default function App() {
               <div><h3>Importera bankfiler</h3><span>Excel .xlsx · välj flera filer samtidigt</span></div>
             </div>
             <label className="file-upload">
-              <input type="file" accept=".xlsx" multiple disabled={!dbReady} onChange={handleFiles} />
-              <span>{dbReady ? 'Välj en eller flera Excel-filer' : 'Läser in lokala kategoriregler...'}</span>
+              <input
+                type="file"
+                accept=".xlsx"
+                multiple
+                disabled={importControlsDisabled({ dbReady, isAnalyzingImport, isImporting })}
+                onChange={handleFiles}
+              />
+              <span>
+                {isAnalyzingImport
+                  ? 'Analyserar valda filer...'
+                  : dbReady
+                    ? 'Välj en eller flera Excel-filer'
+                    : 'Läser in lokala kategoriregler...'}
+              </span>
             </label>
+            {isAnalyzingImport && (
+              <p className="import-busy" role="status">
+                <span className="spinner" aria-hidden="true" />
+                {importAnalysisStatus}
+              </p>
+            )}
+            <section className="import-legend" aria-label="Förklaring av importstatus">
+              <div><strong>Blockerande fel</strong><span>Måste rättas innan filen kan importeras.</span></div>
+              <div><strong>Varning</strong><span>Raden kan importeras men bör kontrolleras.</span></div>
+              <div><strong>Möjlig dublett</strong><span>Raden liknar en tidigare transaktion men tas inte bort automatiskt.</span></div>
+              <div><strong>Redan importerad fil</strong><span>Samma fil har redan lagts in tidigare.</span></div>
+            </section>
+            {importOutcomes.length > 0 && (
+              <section className="import-results" aria-label="Resultat för valda filer">
+                <h4>Importresultat</h4>
+                <ul>
+                  {importOutcomes.map((outcome) => (
+                    <li className={outcome.status} key={`${outcome.status}-${outcome.fileName}`}>
+                      <strong>
+                        {outcome.status === 'imported' ? '✓' : outcome.status === 'failed' ? '✕' : '–'}
+                        {' '}{outcome.fileName}
+                      </strong>
+                      <span>
+                        {outcome.status === 'imported'
+                          ? `${outcome.transactionCount} transaktioner importerades och finns kvar.`
+                          : outcome.status === 'failed'
+                            ? outcome.message
+                            : outcome.reason}
+                      </span>
+                      {outcome.status === 'failed' && outcome.technicalDetails && (
+                        <details>
+                          <summary>Visa teknisk information</summary>
+                          <pre>{outcome.technicalDetails}</pre>
+                        </details>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
             {existingImportMatches.map(({ selectedFileName, batch }) => (
               <div className="existing-import-notice" key={`${selectedFileName}-${batch.id}`}>
                 <div>
@@ -1373,10 +1780,12 @@ export default function App() {
                 <div className="import-actions">
                   <button
                     className="primary-btn"
-                    disabled={isImporting || importBlockingErrors.length > 0}
+                    disabled={isAnalyzingImport || isImporting || importBlockingErrors.length > 0}
                     onClick={() => void handleImport()}
                   >
-                    {isImporting
+                    {isAnalyzingImport
+                      ? 'Analyserar filer...'
+                      : isImporting
                       ? 'Importerar...'
                       : importBlockingErrors.length
                         ? 'Rätta blockerande fel före import'
@@ -1385,13 +1794,9 @@ export default function App() {
                 </div>
               </>
             )}
-            <section className="import-history">
-              <div className="panel-header">
-                <div>
-                  <h3>Importhistorik</h3>
-                  <span>{importBatches.length} spårbara importer</span>
-                </div>
-              </div>
+            <details className="import-history" open={importBatches.length === 0 || undefined}>
+              <summary>Importhistorik ({importBatches.length})</summary>
+              <div className="import-history-content">
               {legacyTransactionCount > 0 && (
                 <p className="budget-hint">
                   {legacyTransactionCount.toLocaleString('sv-SE')} äldre transaktioner saknar detaljerad importhistorik.
@@ -1423,7 +1828,8 @@ export default function App() {
               ) : (
                 <p className="empty-state">Ingen spårbar import har genomförts ännu.</p>
               )}
-            </section>
+              </div>
+            </details>
             {selectedImportBatch && (
               <section className="import-batch-detail">
                 <div className="panel-header">
@@ -1437,7 +1843,7 @@ export default function App() {
                 </div>
                 <div className="table-wrap">
                   <table>
-                    <thead><tr><th>Sheet</th><th>Rad</th><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Typ</th></tr></thead>
+                    <thead><tr><th>Blad</th><th>Rad</th><th>Datum</th><th>Beskrivning</th><th>Belopp</th><th>Kategori</th><th>Typ</th></tr></thead>
                     <tbody>
                       {selectedImportBatch.transactions.map((row) => (
                         <tr key={row.id}>

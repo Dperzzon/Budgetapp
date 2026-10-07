@@ -19,6 +19,20 @@ export const transactionTypes = [
 
 export type TransactionType = typeof transactionTypes[number];
 
+export type PeriodStatus = 'past' | 'current' | 'future';
+
+export function getPeriodStatus(
+  year: number,
+  month: number,
+  now: Date = new Date()
+): PeriodStatus {
+  const target = year * 12 + month;
+  const current = now.getFullYear() * 12 + now.getMonth() + 1;
+  if (target < current) return 'past';
+  if (target > current) return 'future';
+  return 'current';
+}
+
 export type FinancialTransaction = {
   amountCents: number;
   category: string;
@@ -59,7 +73,7 @@ export type MerchantInsight = {
 };
 
 export type MonthlyInsights = {
-  status: 'available' | 'incomplete-month' | 'insufficient-history';
+  status: 'available' | 'incomplete-month' | 'future-period' | 'insufficient-history';
   baselineKind: 'historical-average' | 'previous-month' | null;
   baselineLabel: string | null;
   baselineMonthCount: number;
@@ -158,7 +172,7 @@ export type FinancialHealthInsight = {
 };
 
 export type FinancialHealthSummary = {
-  status: 'good' | 'attention' | 'needs-review';
+  status: 'good' | 'attention' | 'needs-review' | 'future';
   headline: string;
   supportingText: string;
   insights: FinancialHealthInsight[];
@@ -863,8 +877,21 @@ export function buildFinancialHealthSummary(input: {
   monthlyInsights: MonthlyInsights | null;
   recurringInsights: RecurringExpenseAnalysis;
   costTrends: RecurringCostTrendAnalysis;
-  isCurrentMonth: boolean;
+  periodStatus: PeriodStatus;
 }): FinancialHealthSummary {
+  if (input.periodStatus === 'future') {
+    return {
+      status: 'future',
+      headline: 'Den här perioden har inte börjat ännu',
+      supportingText: 'Budgeten kan planeras, men utfall och ekonomiska bedömningar visas först när perioden börjar.',
+      insights: [],
+      importantCount: 0,
+      attentionCount: 0,
+      positiveCount: 0,
+      hiddenCount: 0,
+    };
+  }
+
   const candidates: FinancialHealthInsight[] = [];
   const monthlyByCategory = new Map(
     input.monthlyInsights?.status === 'available'
@@ -904,7 +931,7 @@ export function buildFinancialHealthSummary(input: {
         priorityScore: healthPriority(severity, differenceCents, differencePercent),
       });
     } else if (
-      !input.isCurrentMonth &&
+      input.periodStatus === 'past' &&
       differenceCents <= -50_000 &&
       Math.abs(differencePercent) >= 10
     ) {
@@ -1027,7 +1054,7 @@ export function buildFinancialHealthSummary(input: {
           severity: 'positive',
           type: 'goal-over',
           title,
-          summary: `${formatCurrencyFromCents(differenceCents)} över målet${input.isCurrentMonth ? ' hittills' : ''}`,
+          summary: `${formatCurrencyFromCents(differenceCents)} över målet${input.periodStatus === 'current' ? ' hittills' : ''}`,
           amountCents: differenceCents,
           percent: differencePercent,
           source,
@@ -1042,7 +1069,7 @@ export function buildFinancialHealthSummary(input: {
           severity: 'attention',
           type: 'goal-under',
           title,
-          summary: `${formatCurrencyFromCents(Math.abs(differenceCents))} under målet${input.isCurrentMonth ? ' hittills' : ''}`,
+          summary: `${formatCurrencyFromCents(Math.abs(differenceCents))} under målet${input.periodStatus === 'current' ? ' hittills' : ''}`,
           amountCents: Math.abs(differenceCents),
           percent: Math.abs(differencePercent),
           source,
@@ -1188,6 +1215,7 @@ export function buildMonthlyInsights(
     topMerchants,
   });
 
+  const periodStatus = getPeriodStatus(year, month, today);
   const targetKey = monthKey(year, month);
   const currentKey = monthKey(today.getFullYear(), today.getMonth() + 1);
   const currentTransactions = transactions.filter((transaction) =>
@@ -1218,7 +1246,10 @@ export function buildMonthlyInsights(
     )
     .slice(0, 5);
 
-  if (targetKey >= currentKey) {
+  if (periodStatus === 'future') {
+    return emptyResult('future-period');
+  }
+  if (periodStatus === 'current') {
     return emptyResult('incomplete-month', currentTotalCents, topMerchants);
   }
 

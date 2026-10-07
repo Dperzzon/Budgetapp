@@ -12,6 +12,10 @@
 ## Desktop architecture
 The desktop app runs as a local Tauri shell with a React UI and a Rust-backed SQLite datastore. The data lives in the OS app data directory, which keeps costs near zero and avoids cloud dependencies.
 
+The overview has four presentation modes derived without changing financial calculations: `first-run`, `month`, `year`, and `future-month`. An initialized database with no transactions shows only a local-first import introduction. Month views prioritize financial health, core totals, budgets, and review work; detailed monthly change, recurring-cost, and trend views are grouped in a keyboard-accessible collapsed `details` section. Year views omit that month-analysis group, and future months retain budget planning while suppressing outcome presentation.
+
+Previous and next month controls use calendar month boundaries and complement the existing selectors. Navigation may enter future months because they are valid planning periods; the central period status keeps them visibly marked as planning and prevents outcome semantics.
+
 ## Database design
 A local SQLite database stores transaction history, import batches, categories, learned merchant rules, and monthly category budgets. `PRAGMA user_version` identifies the supported schema. Ordered migrations run in SQLite transactions, newer unknown schema versions are rejected, and foreign keys are enabled for every application connection. Schema version 3 adds a required `transaction_type` with a database `CHECK` constraint for `income`, `expense`, `saving`, `amortization`, `transfer`, `refund`, and `unclassified`.
 
@@ -38,11 +42,13 @@ The import pipeline is deterministic and conservative:
 9. calculate a local SHA-256 hash from the exact file bytes and block files that already have an import batch
 10. persist the import batch and all accepted transactions atomically with source file, worksheet, and Excel row provenance
 
+Import analysis uses a latest-run token. Hashing, duplicate checks, workbook loading, parsing, and validation keep the file controls disabled, and only the latest active run may publish preview state. Multi-file persistence remains atomic per file rather than across the entire selection. Files are processed in order; if one fails, earlier successful files remain committed and are reported explicitly, the failed file is reported as not saved, and later files are marked as skipped. Exact-file SHA-256 protection makes retrying the selection safe.
+
 Tracked imports are listed from SQL aggregates rather than duplicated counters. Deleting an import batch uses the transaction foreign key with `ON DELETE CASCADE`, so its transactions are removed atomically while legacy transactions, other batches, and learned rules remain untouched. Existing transactions created before import batches keep nullable provenance and are not assigned fabricated batches.
 
 The dashboard filters persisted rows by year and month. It compares the selected period with the same month or year from a separately selected comparison year. Monthly budgets are editable per category and stored in SQLite; annual budget totals sum that year's monthly budgets. The review view allows changing the category, changing the economic type of only the selected transaction, or explicitly deleting a selected transaction. Invalid imported dates are blocking validation errors and are not persisted.
 
-Changing a category affects only the selected transaction by default. The user can explicitly choose an exact normalized-merchant bulk update or save an exact learned rule for future imports; these are separate backend operations, and neither happens implicitly. Category describes what a transaction concerns, while `transaction_type` independently controls its financial effect.
+Changing a category affects only the selected transaction by default. The user can explicitly choose an exact normalized-merchant bulk update or save an exact learned rule for future imports; neither happens implicitly. Historical bulk changes require confirmation with the affected count. Remembering a category atomically updates the selected transaction and upserts the future rule in one SQLite transaction. Category describes what a transaction concerns, while `transaction_type` independently controls its financial effect.
 
 Changing an economic type also starts as an unsaved draft. The user must explicitly choose `Endast denna`, `Ändra liknande`, or `Kom ihåg framåt`. Exact bulk updates are atomic and affect only rows with the same normalized merchant key. Remembering a type atomically updates the selected row and stores a separate rule for future imports; it never rewrites historical matches and never changes category. Swish normalization is direction-aware: received and sent Swish use different keys while phone-number variants within the same direction can share a rule.
 
@@ -57,6 +63,8 @@ Financial calculations live in `finance.ts` and are shared by dashboard, monthly
 - remaining after spending and saving = income - consumption expenses - direct savings - amortization
 
 Only `expense` and `refund` affect consumption-category budget outcomes. Transfers and unclassified rows affect none of the main financial totals, and unclassified rows remain visible in the review queue.
+
+`getPeriodStatus` is the shared definition of `past`, `current`, and `future` for selected months. Future months remain editable for budget planning, but the UI suppresses period outcomes, under-budget and under-goal assessments, monthly changes, recurring-cost results, cost trends, and financial-health conclusions until the period starts.
 
 ## Monthly change insights
 Monthly insights are derived in memory by `buildMonthlyInsights` in `finance.ts`; no insight data is persisted. Full analysis is available only for a selected completed month. The year view asks the user to select a month, and the current or a future month states that analysis will be available after the month closes.
